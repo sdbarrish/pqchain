@@ -15,5 +15,6 @@ pub mod ledger;
 pub mod network;
 pub mod node;
 pub mod rpc;
+pub mod snapshot;
 pub mod transport;
 pub mod wallet;

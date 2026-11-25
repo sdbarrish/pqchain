@@ -30,6 +30,8 @@ pub const MAX_ORPHANS: usize = 256;
 pub const SYNC_BATCH: u64 = 32;
 /// Stop dialing newly discovered peers beyond this many connections.
 pub const MAX_PEERS: usize = 32;
+/// Write a ledger snapshot every this many log records.
+pub const SNAPSHOT_EVERY: u64 = 20;
 const MAX_KNOWN_PEERS: usize = 1_000;
 const DISCOVERY_EVERY: Duration = Duration::from_secs(2);
 
@@ -194,6 +196,7 @@ pub struct NodeConfig {
 /// (crash mid-write) is detected and truncated on startup.
 pub struct Store {
     file: std::fs::File,
+    pub dir: PathBuf,
 }
 
 pub enum Record {
@@ -234,7 +237,7 @@ impl Store {
             eprintln!("store: truncating {} bytes of incomplete data", buf.len() - pos);
             file.set_len(pos as u64).map_err(|e| e.to_string())?;
         }
-        Ok((Store { file }, records))
+        Ok((Store { file, dir: dir.to_path_buf() }, records))
     }
 
     fn append(&mut self, kind: u8, payload: &[u8]) {
@@ -433,6 +436,9 @@ pub struct Engine {
     pub me: Address,
     pub ledger: Ledger,
     store: Store,
+    /// Records in the on-disk log (blocks + certificates).
+    records: u64,
+    last_snapshot: u64,
     accepted: BTreeMap<(ChainId, u64), (Block, Option<FinalityCert>)>,
     mempool: Vec<Tx>,
     cands: BTreeMap<ChainId, Vec<Block>>,
@@ -463,6 +469,8 @@ impl Engine {
             key,
             ledger: genesis,
             store,
+            records: 0,
+            last_snapshot: 0,
             accepted: BTreeMap::new(),
             mempool: Vec::new(),
             cands: BTreeMap::new(),
@@ -481,12 +489,27 @@ impl Engine {
             last_sync_req: BTreeMap::new(),
             params: testnet_params(),
         };
-        // Replay the log: rebuild state exactly as it was accepted.
-        let n = records.len();
-        for r in records {
+        // Start from the latest snapshot if it covers a prefix of the log;
+        // re-execute only the records after it.
+        let n = records.len() as u64;
+        let mut skip = 0u64;
+        match crate::snapshot::load(&e.store.dir) {
+            Ok(Some((ledger, covered))) if covered <= n => {
+                e.ledger = ledger;
+                skip = covered;
+                e.last_snapshot = covered;
+            }
+            Ok(Some(_)) => eprintln!("snapshot is ahead of the log; ignoring it"),
+            Ok(None) => {}
+            Err(err) => eprintln!("ignoring snapshot: {err}"),
+        }
+        let started = Instant::now();
+        for (i, r) in records.into_iter().enumerate() {
             match r {
                 Record::Block(b) => {
-                    e.ledger.apply_block(&b).map_err(|err| format!("replay failed: {err}"))?;
+                    if (i as u64) >= skip {
+                        e.ledger.apply_block(&b).map_err(|err| format!("replay failed: {err}"))?;
+                    }
                     e.accepted.insert((b.header().chain, b.header().height), (b, None));
                 }
                 Record::Cert(c) => {
@@ -496,9 +519,12 @@ impl Engine {
                 }
             }
         }
+        e.records = n;
         if n > 0 {
             e.log(format!(
-                "replayed {n} records from disk: kerckhoffs #{} atbash #{} state {}",
+                "restored from disk: snapshot covered {skip} records, re-executed {} in {} ms: kerckhoffs #{} atbash #{} state {}",
+                n - skip,
+                started.elapsed().as_millis(),
                 e.ledger.tip(ChainId::Kerckhoffs).0,
                 e.ledger.tip(ChainId::Atbash).0,
                 short(&e.ledger.state_root())
@@ -650,7 +676,7 @@ impl Engine {
             self.log(format!("BUG: decided block {} #{h} failed to apply: {e}", c.name()));
             return;
         }
-        self.store.append(0, &b.to_bytes());
+        self.persist(0, &b.to_bytes());
         let n = b.body.len();
         let anchor = b.header().anchor;
         self.accepted.insert((c, h), (b, None));
@@ -686,10 +712,24 @@ impl Engine {
         self.retry_orphans();
     }
 
+    fn persist(&mut self, kind: u8, bytes: &[u8]) {
+        self.store.append(kind, bytes);
+        self.records += 1;
+        if self.records - self.last_snapshot >= SNAPSHOT_EVERY {
+            match crate::snapshot::save(&self.store.dir, &self.ledger, self.records) {
+                Ok(()) => {
+                    self.last_snapshot = self.records;
+                    self.log(format!("snapshot written at record {}", self.records));
+                }
+                Err(e) => self.log(format!("snapshot failed: {e}")),
+            }
+        }
+    }
+
     fn set_cert(&mut self, c: ChainId, h: u64, cert: FinalityCert) {
-        if let Some(entry) = self.accepted.get_mut(&(c, h)) {
-            if entry.1.is_none() {
-                self.store.append(1, &cert.to_bytes());
+        if self.accepted.get(&(c, h)).is_some_and(|e| e.1.is_none()) {
+            self.persist(1, &cert.to_bytes());
+            if let Some(entry) = self.accepted.get_mut(&(c, h)) {
                 entry.1 = Some(cert);
             }
         }

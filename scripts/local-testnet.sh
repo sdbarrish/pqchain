@@ -154,8 +154,8 @@ done
 ok "3 more blocks accepted while validator-2 was down"
 start_node validator-2
 wait_all atbash 8 8102
-grep -q "replayed" "$WORK/validator-2.log" || fail "validator-2 did not replay its disk log"
-ok "validator-2 restarted: $(grep replayed "$WORK/validator-2.log" | tail -1 | sed 's/^\[[^]]*\] //')"
+grep -q "restored from disk" "$WORK/validator-2.log" || fail "validator-2 did not replay its disk log"
+ok "validator-2 restarted: $(grep "restored from disk" "$WORK/validator-2.log" | tail -1 | sed 's/^\[[^]]*\] //')"
 ok "validator-2 synced the blocks it missed"
 
 say "Validator exit signed with an SLH-DSA cold key"
@@ -200,6 +200,24 @@ fi
 ok "only zone members proposed zone-0 blocks: $(grep -h 'proposing Zone 0' "$WORK"/*.log | sed 's/^\[\([^]]*\)\].*/\1/' | sort | uniq -c | tr -s ' ' | paste -sd, -)"
 FOLLOW=$(grep -h "accepted Zone 0" "$WORK"/full-0.log | head -1 | sed 's/.*via //; s/;.*//')
 ok "non-members follow zone-0 by finality certificate (full-0: '$FOLLOW')"
+
+say "Staking rewards"
+W0=$(wallet show --key "$WORK/validator-0/withdrawal.key")
+MINTED=$(rpc 8104 /status | jget "d['minted']")
+ok "rewards issued so far: $MINTED; validator-0 has $(rpc 8104 "/rewards/$W0" | jget "d['unclaimed']") unclaimed"
+wallet claim-rewards --key "$WORK/validator-0/withdrawal.key" | sed 's/^/  /'
+wait_all kerckhoffs 7 "${ALL[@]}"
+PAID=$(native 8104 kerckhoffs "$W0")
+[ "$PAID" -gt 0 ] || fail "validator-0 should have been paid"
+ok "validator-0 claimed $PAID with its SLH-DSA cold key (paid on the Kerckhoffs Chain)"
+
+say "Fast restart from a snapshot"
+grep -h "snapshot written" "$WORK/validator-0.log" | tail -1 | sed 's/^/  /'
+kill "$PID_validator_0"
+start_node validator-0
+for _ in $(seq 1 50); do grep -q "restored from disk" "$WORK/validator-0.log" && break; sleep 0.2; done
+ok "validator-0 $(grep -h "restored from disk" "$WORK/validator-0.log" | tail -1 | sed 's/^\[[^]]*\] //')"
+wait_all kerckhoffs 7 8100
 
 say "Final agreement check"
 sleep 1

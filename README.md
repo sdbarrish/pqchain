@@ -11,7 +11,7 @@ Each chain is named after a piece of cryptographic history:
 | **Feistel Chain** *(planned)* | Smart contracts with post-quantum accounts | Feistel networks, which build complex ciphers from simple, composable rounds, as contracts compose |
 | **Hamming Chain** *(planned)* | Hash-based data availability for rollups | Hamming codes, the first error-correcting codes; data availability relies on erasure coding |
 | **Playfair Chain** *(planned)* | Bridges to other networks | The Playfair cipher, which works on pairs of letters, as a bridge links pairs of chains |
-| **Zones** *(planned)* | Sovereign application chains with their own validators | |
+| **Zones** | Application chains validated by a chosen subset of primary validators | |
 
 > **Prototype.** Not audited and not for real value.
 
@@ -27,6 +27,23 @@ Each chain is named after a piece of cryptographic history:
 | Consensus | Sampled Quorum Consensus: repeated stake-weighted random polls (k=20, alpha=14, beta=20). Deterministic stake-weighted leader schedule. |
 | Node tiers | Tier-1 validators, full node (replays everything, no stake), light client (checks >2/3-stake finality certificates) |
 | Safety | `#![forbid(unsafe_code)]`. Failed blocks leave state untouched. Non-malleable txids (signatures excluded). |
+
+## Zones and relay messages (v2)
+
+| Piece | Implementation |
+|---|---|
+| Registration | `CreateZone { name, members }` on the Kerckhoffs Chain (fee 100, burned). Members must be active primary validators. |
+| Validation | Only members propose and vote on a zone. Its finality certificates need > 2/3 of the members' stake. Other nodes follow by certificate. |
+| Relay messages | Exports into or out of a zone become messages committed in the block header's `msg_root`. |
+| Claiming | The receiving chain checks the source block's certificate against the source chain's validator set, plus a Merkle proof from the message to `msg_root`. Each message can be claimed once. |
+| Routes | Atbash ↔ zone and zone ↔ zone. The Kerckhoffs Chain only exchanges with the Atbash Chain, via atomic memory. |
+
+```bash
+pqchain wallet create-zone --key payer.key --name games --members <node1>,<node2>,<node3>
+pqchain wallet export --key alice.key --amount 4000 --from atbash --to zone-0
+pqchain wallet relay-import --key alice.key --chain zone-0
+pqchain wallet send --key alice.key --to <bob> --amount 1500 --chain zone-0
+```
 
 ## Run
 
@@ -89,6 +106,7 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 - **v1 (done, milestone 1)**: real P2P with hybrid post-quantum transport, consensus over the network, finality certificates, persistent storage, sync, RPC, wallet CLI, multi-process testnet
 - **v1 milestone 2**: Feistel Chain (smart contracts with PQ accounts), staking rewards and expiry, sentry nodes, peer discovery, state snapshots (no full replay), Docker images
 - **v2 step 1 (done)**: SLH-DSA (FIPS 205, hash-based) cold keys; validator exit authorized by the cold withdrawal key, with a 10-block unbonding period during which misbehaviour is still slashable
+- **v2 step 2 (done)**: zones (application chains validated by a subset of primary validators, registered on the Kerckhoffs Chain) and relay messages: cross-chain transfers proven by the source block's finality certificate plus a Merkle inclusion proof, claimable exactly once
 - **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
 - **v3**: Hamming Chain (hash-based data availability), Playfair Chain bridges, fuzzing, formal verification (Kani/Verus), external audits
 

@@ -35,11 +35,11 @@ fn messages_roundtrip() {
     let mut cert = FinalityCert::new(ChainId::Atbash, 1, b.hash());
     cert.add_vote(&v);
     let tx = match &b.body {
-        Body::Atbash(t) => Tx::Atbash(t[0].clone()),
+        Body::Atbash(t) => Tx::Utxo(ChainId::Atbash, t[0].clone()),
         _ => unreachable!(),
     };
     for m in [
-        Msg::Status { kerckhoffs: 3, atbash: 9 },
+        Msg::Status { tips: vec![(ChainId::Kerckhoffs, 3), (ChainId::Atbash, 9), (ChainId::Zone(7), 2)] },
         Msg::Tx(tx),
         Msg::Block(b.clone()),
         Msg::Query { id: 1, chain: ChainId::Kerckhoffs, height: 2 },

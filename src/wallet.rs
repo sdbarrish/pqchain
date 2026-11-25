@@ -69,9 +69,42 @@ fn native_only(v: Vec<(OutPoint, TxOut)>) -> Vec<(OutPoint, TxOut)> {
 
 fn wrap(chain: ChainId, base: Transfer, kind: KerckhoffsKind, n: usize, key: &Keypair) -> Tx {
     match chain {
-        ChainId::Atbash => Tx::Atbash(AtbashTx { base, create_asset: None }.sign(&vec![key; n])),
         ChainId::Kerckhoffs => Tx::Kerckhoffs(KerckhoffsTx { base, kind }.sign(&vec![key; n])),
+        _ => Tx::Utxo(chain, AtbashTx { base, create_asset: None }.sign_for(chain, &vec![key; n])),
     }
+}
+
+/// Register a zone validated by `members` (primary validator node ids).
+pub fn create_zone(c: &Client, key: &Keypair, name: &str, members: Vec<Address>) -> Result<Tx, String> {
+    let pool = native_only(c.utxos(ChainId::Kerckhoffs, &key.address())?);
+    let (base, n) = native_transfer_from_pool(pool, Source::Local, key, vec![], None, ZONE_FEE - TX_FEE)?;
+    let kind = KerckhoffsKind::CreateZone { name: name.into(), members };
+    Ok(wrap(ChainId::Kerckhoffs, base, kind, n, key))
+}
+
+/// Claim every relay message addressed to this wallet on `chain`. Each
+/// input carries its own proof, which the receiving chain verifies against
+/// the source chain's validator set.
+pub fn relay_import(c: &Client, key: &Keypair, chain: ChainId) -> Result<(Tx, u64), String> {
+    if chain == ChainId::Kerckhoffs {
+        return Err("relay messages go to the Atbash Chain or zones".into());
+    }
+    let v = c.get(&format!("/inbox/{}/{}", chain_slug(chain), key.address().to_text()))?;
+    let items = v.as_array().ok_or("unexpected RPC reply")?;
+    let proofs: Vec<RelayIn> = items
+        .iter()
+        .map(|i| RelayIn::from_bytes(&hex::decode(i["proof"].as_str().unwrap_or("")).map_err(|e| e.to_string())?))
+        .collect::<Result<_, _>>()?;
+    let proofs: Vec<RelayIn> = proofs.into_iter().filter(|p| p.msg.out.asset == NATIVE).collect();
+    let total: u64 = proofs.iter().map(|p| p.msg.out.amount).sum();
+    if total <= TX_FEE {
+        return Err("no relay messages to claim".into());
+    }
+    let spends: Vec<_> = proofs.iter().map(|p| (p.msg.outpoint(), Source::Relay, key)).collect();
+    let mut base = Transfer::spend(&spends, vec![TxOut::native(key.address(), total - TX_FEE)]);
+    base.relay_in = proofs;
+    let n = spends.len();
+    Ok((Tx::Utxo(chain, AtbashTx { base, create_asset: None }.sign_for(chain, &vec![key; n])), total - TX_FEE))
 }
 
 /// Plain payment on either chain.
@@ -131,5 +164,5 @@ pub fn create_asset(c: &Client, key: &Keypair, name: &str, supply: u64) -> Resul
     let id = tx.new_asset_id().ok_or("asset creation needs an input")?;
     base.outputs.push(TxOut { owner: key.address(), asset: id, amount: supply });
     tx.base = base;
-    Ok((Tx::Atbash(tx.sign(&vec![key; n])), id))
+    Ok((Tx::Utxo(ChainId::Atbash, tx.sign(&vec![key; n])), id))
 }

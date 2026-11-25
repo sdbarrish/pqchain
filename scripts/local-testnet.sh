@@ -50,6 +50,21 @@ wait_all() { # chain height ports...
   for p in "$@"; do wait_height "$p" "$c" "$h"; done
 }
 
+zone_height() { # port zone-id
+  rpc "$1" /status | jget "[z['height'] for z in d['zones'] if z['id']==$2][0]"
+}
+
+wait_zone() { # zone-id height ports...
+  local z=$1 h=$2; shift 2
+  for p in "$@"; do
+    for _ in $(seq 1 150); do
+      [ "$(zone_height "$p" "$z" 2>/dev/null || echo 0)" -ge "$h" ] && continue 2
+      sleep 0.2
+    done
+    fail "port $p: zone $z did not reach height $h"
+  done
+}
+
 native() { # port chain address
   rpc "$1" "/balance/$2/$3" | jget "d['assets'].get('native',0)"
 }
@@ -149,14 +164,45 @@ wallet send --key "$WORK/alice.key" --to "$BOB" --amount 100 >/dev/null
 wait_all atbash 9 "${ALL[@]}"
 ok "network keeps finalizing without validator-3"
 
+say "Zones and relay messages"
+M0=$(wallet show --key "$WORK/validator-0/node.key")
+M1=$(wallet show --key "$WORK/validator-1/node.key")
+M2=$(wallet show --key "$WORK/validator-2/node.key")
+wallet create-zone --key "$WORK/faucet.key" --name games --members "$M0,$M1,$M2" | sed 's/^/  /'
+wait_all kerckhoffs 6 "${ALL[@]}"
+ok "zone-0 'games' registered; members: validator-0, validator-1, validator-2"
+BOB_A0=$(native 8104 atbash "$BOB")
+wallet export --key "$WORK/alice.key" --amount 4000 --from atbash --to zone-0 | sed 's/^/  /'
+wait_all atbash 10 "${ALL[@]}"
+INBOX=$(rpc 8104 "/inbox/zone-0/$ALICE" | jget "[(m['amount'], m['proof_bytes']) for m in d]")
+ok "relay message waiting in alice's zone-0 inbox (amount, proof size): $INBOX"
+wallet relay-import --key "$WORK/alice.key" --chain zone-0 | sed 's/^/  /'
+wait_zone 0 1 "${ALL[@]}"
+[ "$(native 8104 zone-0 "$ALICE")" = 3999 ] || fail "alice should hold 3999 on zone-0"
+ok "alice claimed 3999 on zone-0 (proof checked against primary validators' certificate)"
+wallet send --key "$WORK/alice.key" --to "$BOB" --amount 1500 --chain zone-0 | sed 's/^/  /'
+wait_zone 0 2 "${ALL[@]}"
+wallet export --key "$WORK/bob.key" --amount 1000 --from zone-0 --to atbash | sed 's/^/  /'
+wait_zone 0 3 "${ALL[@]}"
+wallet relay-import --key "$WORK/bob.key" --chain atbash | sed 's/^/  /'
+wait_all atbash 11 "${ALL[@]}"
+[ "$(native 8104 atbash "$BOB")" = $((BOB_A0 + 999)) ] || fail "bob should have received 999 on atbash"
+ok "bob paid on zone-0, moved 1000 back to atbash (proof checked against zone members' certificate)"
+if grep -h "proposing Zone 0" "$WORK"/validator-3.log "$WORK"/validator-4.log "$WORK"/full-0.log 2>/dev/null | grep -q .; then
+  fail "a non-member proposed a zone block"
+fi
+ok "only zone members proposed zone-0 blocks: $(grep -h 'proposing Zone 0' "$WORK"/*.log | sed 's/^\[\([^]]*\)\].*/\1/' | sort | uniq -c | tr -s ' ' | paste -sd, -)"
+FOLLOW=$(grep -h "accepted Zone 0" "$WORK"/full-0.log | head -1 | sed 's/.*via //; s/;.*//')
+ok "non-members follow zone-0 by finality certificate (full-0: '$FOLLOW')"
+
 say "Final agreement check"
 sleep 1
 ROOTS=()
 for p in "${ALL[@]}"; do
   s=$(rpc "$p" /status)
-  printf '  %-12s kerckhoffs #%s  atbash #%s  state %s\n' "$(echo "$s" | jget "d['node']")" \
+  printf '  %-12s kerckhoffs #%s  atbash #%s  zone-0 #%s  state %s\n' "$(echo "$s" | jget "d['node']")" \
     "$(echo "$s" | jget "d['kerckhoffs']['height']")" "$(echo "$s" | jget "d['atbash']['height']")" \
-    "$(echo "$s" | jget "d['state_root'][:16]")"
+    "$(echo "$s" | jget "d['zones'][0]['height'] if d['zones'] else '-'")" "$(echo "$s" | jget "d['state_root'][:16]")"
   ROOTS+=("$(echo "$s" | jget "d['state_root']")")
 done
 [ "$(printf '%s\n' "${ROOTS[@]}" | sort -u | wc -l)" = 1 ] || fail "state roots differ"

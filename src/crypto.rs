@@ -105,6 +105,45 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
     level[0]
 }
 
+fn merkle_leaf(l: &Hash) -> Hash {
+    Enc::new("pqchain/merkle/leaf").bytes(l).hash()
+}
+
+fn merkle_node(a: &Hash, b: &Hash) -> Hash {
+    Enc::new("pqchain/merkle/node").bytes(a).bytes(b).hash()
+}
+
+/// Sibling path proving that `leaves[index]` is in `merkle_root(leaves)`.
+pub fn merkle_branch(leaves: &[Hash], index: usize) -> Vec<Hash> {
+    let mut level: Vec<Hash> = leaves.iter().map(merkle_leaf).collect();
+    let mut idx = index;
+    let mut branch = Vec::new();
+    while level.len() > 1 {
+        let sib = *level.get(idx ^ 1).unwrap_or(&level[idx]);
+        branch.push(sib);
+        level = level
+            .chunks(2)
+            .map(|c| merkle_node(&c[0], c.get(1).unwrap_or(&c[0])))
+            .collect();
+        idx /= 2;
+    }
+    branch
+}
+
+/// Check a Merkle inclusion proof produced by [`merkle_branch`].
+pub fn merkle_verify(leaf: &Hash, index: u32, branch: &[Hash], root: &Hash) -> bool {
+    if branch.len() > 32 {
+        return false;
+    }
+    let mut node = merkle_leaf(leaf);
+    let mut idx = index as u64;
+    for sib in branch {
+        node = if idx % 2 == 0 { merkle_node(&node, sib) } else { merkle_node(sib, &node) };
+        idx /= 2;
+    }
+    idx == 0 && &node == root
+}
+
 /// 256-bit address = SHA3-256(alg_id || public key). The public key itself
 /// stays hidden until the owner first spends.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

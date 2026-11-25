@@ -35,20 +35,25 @@ pub fn testnet_params() -> Params {
     Params { k: 20, alpha: 12, beta: 15, max_rounds: 0 }
 }
 
-pub const CHAINS: [ChainId; 2] = [ChainId::Kerckhoffs, ChainId::Atbash];
-
 pub fn chain_from_str(s: &str) -> Result<ChainId, String> {
-    match s.to_ascii_lowercase().as_str() {
+    let s = s.to_ascii_lowercase();
+    match s.as_str() {
         "kerckhoffs" | "k" => Ok(ChainId::Kerckhoffs),
         "atbash" | "a" => Ok(ChainId::Atbash),
-        _ => Err(format!("unknown chain '{s}' (use atbash or kerckhoffs)")),
+        _ => s
+            .strip_prefix("zone-")
+            .or_else(|| s.strip_prefix("zone:"))
+            .and_then(|n| n.parse().ok())
+            .map(ChainId::Zone)
+            .ok_or(format!("unknown chain '{s}' (use atbash, kerckhoffs or zone-N)")),
     }
 }
 
-pub fn chain_slug(c: ChainId) -> &'static str {
+pub fn chain_slug(c: ChainId) -> String {
     match c {
-        ChainId::Kerckhoffs => "kerckhoffs",
-        ChainId::Atbash => "atbash",
+        ChainId::Kerckhoffs => "kerckhoffs".into(),
+        ChainId::Atbash => "atbash".into(),
+        ChainId::Zone(n) => format!("zone-{n}"),
     }
 }
 
@@ -239,7 +244,8 @@ impl Store {
 
 #[derive(Clone, Debug)]
 pub enum Msg {
-    Status { kerckhoffs: u64, atbash: u64 },
+    /// Tips of every chain the sender tracks.
+    Status { tips: Vec<(ChainId, u64)> },
     Tx(Tx),
     Block(Block),
     Query { id: u64, chain: ChainId, height: u64 },
@@ -248,6 +254,16 @@ pub enum Msg {
     GetBlocks { chain: ChainId, from: u64 },
     Blocks(Vec<(Block, FinalityCert)>),
     WantBlock { chain: ChainId, height: u64, hash: Hash },
+}
+
+impl Wire for (ChainId, u64) {
+    fn put(&self, w: &mut Writer) {
+        self.0.put(w);
+        w.u64(self.1);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok((ChainId::get(r)?, r.u64()?))
+    }
 }
 
 impl Wire for (Block, FinalityCert) {
@@ -263,10 +279,9 @@ impl Wire for (Block, FinalityCert) {
 impl Wire for Msg {
     fn put(&self, w: &mut Writer) {
         match self {
-            Msg::Status { kerckhoffs, atbash } => {
+            Msg::Status { tips } => {
                 w.u8(0);
-                w.u64(*kerckhoffs);
-                w.u64(*atbash);
+                w.list(tips);
             }
             Msg::Tx(t) => {
                 w.u8(1);
@@ -320,7 +335,7 @@ impl Wire for Msg {
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         Ok(match r.u8()? {
-            0 => Msg::Status { kerckhoffs: r.u64()?, atbash: r.u64()? },
+            0 => Msg::Status { tips: r.list()? },
             1 => Msg::Tx(Tx::get(r)?),
             2 => Msg::Block(Block::get(r)?),
             3 => Msg::Query { id: r.u64()?, chain: ChainId::get(r)?, height: r.u64()? },
@@ -385,7 +400,6 @@ pub struct Engine {
     wait_since: BTreeMap<ChainId, Instant>,
     proposed: BTreeSet<(ChainId, u64, u32)>,
     pub peers: BTreeMap<Address, PeerTx>,
-    peer_tips: BTreeMap<Address, (u64, u64)>,
     last_status: Instant,
     last_sync_req: BTreeMap<ChainId, Instant>,
     params: Params,
@@ -409,10 +423,9 @@ impl Engine {
             next_poll: 1,
             votes: BTreeMap::new(),
             wanted: BTreeSet::new(),
-            wait_since: CHAINS.iter().map(|c| (*c, now)).collect(),
+            wait_since: BTreeMap::new(),
             proposed: BTreeSet::new(),
             peers: BTreeMap::new(),
-            peer_tips: BTreeMap::new(),
             last_status: now,
             last_sync_req: BTreeMap::new(),
             params: testnet_params(),
@@ -466,16 +479,20 @@ impl Engine {
         self.ledger.validators.get(&self.me).is_some_and(|v| v.weight() > 0)
     }
 
+    /// Whether this node proposes and votes on `chain` (zones: members only).
+    pub fn active_in(&self, chain: ChainId) -> bool {
+        self.ledger
+            .chain_validators(chain, self.ledger.current_anchor())
+            .is_some_and(|s| s.get(&self.me).is_some_and(|v| v.weight() > 0))
+    }
+
     pub fn on_connect(&mut self, peer: Address) {
         self.log(format!("connected to {peer} (ML-KEM-768 + X25519, ML-DSA-65 authenticated)"));
         self.send(&peer, &self.status_msg());
     }
 
     fn status_msg(&self) -> Msg {
-        Msg::Status {
-            kerckhoffs: self.ledger.tip(ChainId::Kerckhoffs).0,
-            atbash: self.ledger.tip(ChainId::Atbash).0,
-        }
+        Msg::Status { tips: self.ledger.chains().into_iter().map(|c| (c, self.ledger.tip(c).0)).collect() }
     }
 
     // ── transactions ──
@@ -571,12 +588,12 @@ impl Engine {
             short(&self.ledger.state_root())
         ));
 
-        // Validators sign the accepted block for the finality certificate.
+        // Validators of this chain sign the accepted block for the finality certificate.
         let signer = self
             .ledger
-            .validators_at(anchor)
-            .and_then(|s| s.get(&self.me))
-            .is_some_and(|v| !v.slashed);
+            .chain_validators(c, anchor)
+            .and_then(|s| s.get(&self.me).map(|v| v.weight() > 0))
+            .unwrap_or(false);
         if signer {
             let sig = self.key.sign(ctx::VOTE, &vote_msg(c, h, &hash));
             self.votes.entry((c, h)).or_default().push((hash, self.me, sig.clone()));
@@ -604,14 +621,14 @@ impl Engine {
     fn cert_from_votes(&self, c: ChainId, h: u64, b: &Block) -> Option<FinalityCert> {
         let hash = b.hash();
         let votes = self.votes.get(&(c, h))?;
+        let set = self.ledger.chain_validators(c, b.header().anchor)?;
         let mut cert = FinalityCert::new(c, h, hash);
         cert.votes = votes
             .iter()
-            .filter(|(vh, _, _)| *vh == hash)
+            .filter(|(vh, a, _)| *vh == hash && set.get(a).is_some_and(|v| v.weight() > 0))
             .map(|(_, a, s)| (*a, s.clone()))
             .collect();
-        let set = self.ledger.validators_at(b.header().anchor)?;
-        LightClient::from_validators(set).verify(&cert).ok()?;
+        LightClient::from_validators(&set).verify(&cert).ok()?;
         Some(cert)
     }
 
@@ -668,7 +685,7 @@ impl Engine {
         if self.polls.values().any(|p| p.chain == c) {
             return;
         }
-        let Some(set) = self.ledger.validators_at(self.ledger.current_anchor()) else { return };
+        let Some(set) = self.ledger.chain_validators(c, self.ledger.current_anchor()) else { return };
         let active: Vec<(Address, u64)> =
             set.values().filter(|v| v.weight() > 0).map(|v| (v.node_id, v.weight())).collect();
         let total: u64 = active.iter().map(|(_, w)| w).sum();
@@ -761,12 +778,9 @@ impl Engine {
     // ── proposing ──
 
     fn maybe_propose(&mut self) {
-        if !self.is_active_validator() {
-            return;
-        }
         let now = Instant::now();
-        for c in CHAINS {
-            if self.cands.get(&c).is_some_and(|v| !v.is_empty()) {
+        for c in self.ledger.chains() {
+            if !self.active_in(c) || self.cands.get(&c).is_some_and(|v| !v.is_empty()) {
                 continue;
             }
             let txs: Vec<Tx> = self.mempool.iter().filter(|t| t.chain() == c).cloned().collect();
@@ -774,7 +788,7 @@ impl Engine {
                 self.wait_since.insert(c, now);
                 continue;
             }
-            let waited = now - self.wait_since[&c];
+            let waited = now - *self.wait_since.entry(c).or_insert(now);
             let round = (waited.as_millis() / ROUND_TIME.as_millis()) as u32;
             let (h, parent) = self.ledger.tip(c);
             let anchor = self.ledger.current_anchor();
@@ -794,11 +808,11 @@ impl Engine {
                 ChainId::Kerckhoffs => Body::Kerckhoffs(
                     picked.into_iter().filter_map(|t| if let Tx::Kerckhoffs(t) = t { Some(t) } else { None }).collect(),
                 ),
-                ChainId::Atbash => Body::Atbash(
-                    picked.into_iter().filter_map(|t| if let Tx::Atbash(t) = t { Some(t) } else { None }).collect(),
+                _ => Body::Atbash(
+                    picked.into_iter().filter_map(|t| if let Tx::Utxo(_, t) = t { Some(t) } else { None }).collect(),
                 ),
             };
-            let b = propose_round(&self.ledger, &self.key, body, unix_now(), round);
+            let b = propose_on(&self.ledger, &self.key, c, body, unix_now(), round);
             self.log(format!("proposing {} #{} {} (round {round}, {} txs)", c.name(), h + 1, short(&b.hash()), b.body.len()));
             self.add_block(b, None);
         }
@@ -807,10 +821,12 @@ impl Engine {
 
     // ── sync ──
 
-    fn on_status(&mut self, from: Address, k: u64, a: u64) {
-        self.peer_tips.insert(from, (k, a));
+    fn on_status(&mut self, from: Address, tips: Vec<(ChainId, u64)>) {
         let now = Instant::now();
-        for (c, theirs) in [(ChainId::Kerckhoffs, k), (ChainId::Atbash, a)] {
+        for (c, theirs) in tips {
+            if !self.ledger.knows(c) {
+                continue; // e.g. a zone created in a Kerckhoffs block we have not synced yet
+            }
             let mine = self.ledger.tip(c).0;
             let recent = self.last_sync_req.get(&c).is_some_and(|t| now - *t < Duration::from_millis(500));
             if theirs > mine && !recent {
@@ -843,11 +859,11 @@ impl Engine {
             if h != tip + 1 || cert.chain != c || cert.height != h || cert.block != b.hash() {
                 break;
             }
-            let Some(set) = self.ledger.validators_at(b.header().anchor) else { break };
             if b.header().anchor > self.ledger.current_anchor() {
                 break; // need Kerckhoffs blocks first
             }
-            if LightClient::from_validators(set).verify(&cert).is_err() {
+            let Some(set) = self.ledger.chain_validators(c, b.header().anchor) else { break };
+            if LightClient::from_validators(&set).verify(&cert).is_err() {
                 self.log(format!("sync: bad certificate for {} #{h}", c.name()));
                 break;
             }
@@ -862,7 +878,7 @@ impl Engine {
 
     pub fn on_msg(&mut self, from: Address, m: Msg) {
         match m {
-            Msg::Status { kerckhoffs, atbash } => self.on_status(from, kerckhoffs, atbash),
+            Msg::Status { tips } => self.on_status(from, tips),
             Msg::Tx(t) => {
                 let _ = self.submit_tx(t, Some(from));
             }
@@ -902,8 +918,8 @@ impl Engine {
         for id in expired {
             self.finish_poll(id);
         }
-        for c in CHAINS {
-            if self.cands.get(&c).is_some_and(|v| !v.is_empty()) && self.is_active_validator() {
+        for c in self.ledger.chains() {
+            if self.cands.get(&c).is_some_and(|v| !v.is_empty()) && self.active_in(c) {
                 self.start_poll(c);
             }
         }
@@ -923,6 +939,19 @@ impl Engine {
             let certified = self.accepted.get(&(c, h)).is_some_and(|e| e.1.is_some());
             serde_json::json!({ "height": h, "hash": hex::encode(hash), "certified": certified || h == 0 })
         };
+        let zones: Vec<serde_json::Value> = self
+            .ledger
+            .zones
+            .values()
+            .map(|z| {
+                let mut v = chain(ChainId::Zone(z.id));
+                v["id"] = z.id.into();
+                v["name"] = z.name.clone().into();
+                v["members"] = z.members.iter().map(|m| m.to_text()).collect::<Vec<_>>().into();
+                v["member"] = z.members.contains(&self.me).into();
+                v
+            })
+            .collect();
         serde_json::json!({
             "node": self.name,
             "address": self.me.to_text(),
@@ -930,11 +959,38 @@ impl Engine {
             "peers": self.peers.keys().map(|a| a.to_text()).collect::<Vec<_>>(),
             "kerckhoffs": chain(ChainId::Kerckhoffs),
             "atbash": chain(ChainId::Atbash),
+            "zones": zones,
             "mempool": self.mempool.len(),
             "state_root": hex::encode(self.ledger.state_root()),
             "total_stake": self.ledger.total_weight(),
             "burned": self.ledger.burned,
         })
+    }
+
+    /// Unclaimed relay messages addressed to `owner` on `dest`, each with a
+    /// self-contained proof (header + finality certificate + Merkle path).
+    pub fn inbox(&self, dest: ChainId, owner: &Address) -> Vec<RelayIn> {
+        let mut out = Vec::new();
+        for (b, cert) in self.accepted.values() {
+            let Some(cert) = cert else { continue };
+            let msgs = b.messages();
+            let hashes: Vec<Hash> = msgs.iter().map(RelayMsg::hash).collect();
+            for (i, m) in msgs.iter().enumerate() {
+                if m.dest == dest
+                    && &m.out.owner == owner
+                    && !self.ledger.relay_consumed.contains(&(m.src, m.outpoint()))
+                {
+                    out.push(RelayIn {
+                        msg: m.clone(),
+                        header: b.header().clone(),
+                        cert: cert.clone(),
+                        leaf: i as u32,
+                        branch: merkle_branch(&hashes, i),
+                    });
+                }
+            }
+        }
+        out
     }
 
     pub fn block_json(&self, c: ChainId, h: u64) -> Option<serde_json::Value> {
@@ -944,6 +1000,7 @@ impl Engine {
             "chain": chain_slug(c), "height": h, "hash": hex::encode(b.hash()),
             "parent": hex::encode(hd.parent), "proposer": hd.proposer.to_text(),
             "round": hd.round, "anchor": hd.anchor, "timestamp": hd.timestamp,
+            "relay_messages": b.messages().len(),
             "txs": b.body.tx_ids().iter().map(hex::encode).collect::<Vec<_>>(),
             "certificate": cert.as_ref().map(|c| serde_json::json!({
                 "votes": c.votes.len(), "bytes": c.size_bytes() })),

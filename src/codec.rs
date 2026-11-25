@@ -161,12 +161,20 @@ impl Wire for Signature {
 
 impl Wire for ChainId {
     fn put(&self, w: &mut Writer) {
-        w.u8(self.tag())
+        match self {
+            ChainId::Kerckhoffs => w.u8(0),
+            ChainId::Atbash => w.u8(1),
+            ChainId::Zone(n) => {
+                w.u8(2);
+                w.u32(*n);
+            }
+        }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         match r.u8()? {
             0 => Ok(ChainId::Kerckhoffs),
             1 => Ok(ChainId::Atbash),
+            2 => Ok(ChainId::Zone(r.u32()?)),
             _ => Err("unknown chain id".into()),
         }
     }
@@ -174,15 +182,58 @@ impl Wire for ChainId {
 
 impl Wire for Option<ChainId> {
     fn put(&self, w: &mut Writer) {
-        w.u8(self.map_or(255, |c| c.tag()))
+        match self {
+            None => w.u8(0),
+            Some(c) => {
+                w.u8(1);
+                c.put(w);
+            }
+        }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         match r.u8()? {
-            255 => Ok(None),
-            0 => Ok(Some(ChainId::Kerckhoffs)),
-            1 => Ok(Some(ChainId::Atbash)),
-            _ => Err("unknown chain id".into()),
+            0 => Ok(None),
+            1 => Ok(Some(ChainId::get(r)?)),
+            _ => Err("bad optional chain flag".into()),
         }
+    }
+}
+
+impl Wire for RelayMsg {
+    fn put(&self, w: &mut Writer) {
+        self.src.put(w);
+        self.dest.put(w);
+        w.fixed(&self.txid);
+        w.u32(self.index);
+        self.out.put(w);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok(RelayMsg {
+            src: ChainId::get(r)?,
+            dest: ChainId::get(r)?,
+            txid: r.hash()?,
+            index: r.u32()?,
+            out: TxOut::get(r)?,
+        })
+    }
+}
+
+impl Wire for RelayIn {
+    fn put(&self, w: &mut Writer) {
+        self.msg.put(w);
+        self.header.put(w);
+        self.cert.put(w);
+        w.u32(self.leaf);
+        w.list(&self.branch);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok(RelayIn {
+            msg: RelayMsg::get(r)?,
+            header: BlockHeader::get(r)?,
+            cert: FinalityCert::get(r)?,
+            leaf: r.u32()?,
+            branch: r.list()?,
+        })
     }
 }
 
@@ -213,6 +264,7 @@ impl Wire for TxIn {
         w.u8(match self.source {
             Source::Local => 0,
             Source::Atomic => 1,
+            Source::Relay => 2,
         });
         self.pubkey.put(w);
         self.sig.put(w);
@@ -222,6 +274,7 @@ impl Wire for TxIn {
         let source = match r.u8()? {
             0 => Source::Local,
             1 => Source::Atomic,
+            2 => Source::Relay,
             _ => return Err("bad input source".into()),
         };
         Ok(TxIn { prev, source, pubkey: PublicKey::get(r)?, sig: Signature::get(r)? })
@@ -234,6 +287,7 @@ impl Wire for Transfer {
         w.list(&self.outputs);
         self.export_to.put(w);
         w.list(&self.exported);
+        w.list(&self.relay_in);
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         Ok(Transfer {
@@ -241,6 +295,7 @@ impl Wire for Transfer {
             outputs: r.list()?,
             export_to: Option::<ChainId>::get(r)?,
             exported: r.list()?,
+            relay_in: r.list()?,
         })
     }
 }
@@ -284,6 +339,7 @@ impl Wire for BlockHeader {
         w.u64(self.timestamp);
         w.u32(self.round);
         w.u64(self.anchor);
+        w.fixed(&self.msg_root);
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         Ok(BlockHeader {
@@ -295,6 +351,7 @@ impl Wire for BlockHeader {
             timestamp: r.u64()?,
             round: r.u32()?,
             anchor: r.u64()?,
+            msg_root: r.hash()?,
         })
     }
 }
@@ -337,6 +394,11 @@ impl Wire for KerckhoffsTx {
                 authority.put(w);
                 sig.put(w);
             }
+            KerckhoffsKind::CreateZone { name, members } => {
+                w.u8(5);
+                w.bytes(name.as_bytes());
+                w.list(members);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
@@ -362,6 +424,13 @@ impl Wire for KerckhoffsTx {
                 authority: PublicKey::get(r)?,
                 sig: Signature::get(r)?,
             },
+            5 => {
+                let name = String::from_utf8(r.bytes()?).map_err(|_| "zone name not UTF-8")?;
+                if name.len() > 32 {
+                    return Err("zone name too long".into());
+                }
+                KerckhoffsKind::CreateZone { name, members: r.list()? }
+            }
             _ => return Err("unknown Kerckhoffs tx kind".into()),
         };
         Ok(KerckhoffsTx { base, kind })
@@ -420,31 +489,31 @@ impl Wire for FinalityCert {
     }
 }
 
-/// Any transaction, tagged by chain.
+/// Any transaction, tagged by chain. `Utxo` covers the Atbash Chain and zones.
 #[derive(Clone, Debug)]
 pub enum Tx {
     Kerckhoffs(KerckhoffsTx),
-    Atbash(AtbashTx),
+    Utxo(ChainId, AtbashTx),
 }
 
 impl Tx {
     pub fn chain(&self) -> ChainId {
         match self {
             Tx::Kerckhoffs(_) => ChainId::Kerckhoffs,
-            Tx::Atbash(_) => ChainId::Atbash,
+            Tx::Utxo(c, _) => *c,
         }
     }
     pub fn id(&self) -> Hash {
         match self {
             Tx::Kerckhoffs(t) => t.id(),
-            Tx::Atbash(t) => t.id(),
+            Tx::Utxo(_, t) => t.id(),
         }
     }
     /// Validate and apply to `l` (callers pass a clone to test).
     pub fn apply(&self, l: &mut Ledger) -> Result<(), String> {
         match self {
             Tx::Kerckhoffs(t) => l.apply_kerckhoffs(t),
-            Tx::Atbash(t) => l.apply_atbash(t),
+            Tx::Utxo(c, t) => l.apply_utxo(*c, t),
         }
     }
 }
@@ -456,8 +525,9 @@ impl Wire for Tx {
                 w.u8(0);
                 t.put(w);
             }
-            Tx::Atbash(t) => {
+            Tx::Utxo(c, t) => {
                 w.u8(1);
+                c.put(w);
                 t.put(w);
             }
         }
@@ -465,7 +535,7 @@ impl Wire for Tx {
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         match r.u8()? {
             0 => Ok(Tx::Kerckhoffs(KerckhoffsTx::get(r)?)),
-            1 => Ok(Tx::Atbash(AtbashTx::get(r)?)),
+            1 => Ok(Tx::Utxo(ChainId::get(r)?, AtbashTx::get(r)?)),
             _ => Err("unknown tx chain".into()),
         }
     }

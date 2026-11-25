@@ -6,6 +6,8 @@
 //! GET  /utxos/{chain}/{address}     spendable outputs
 //! GET  /atomic/{chain}/{address}    outputs exported to `chain`, awaiting import
 //! GET  /block/{chain}/{height}      block summary + certificate size
+//! GET  /inbox/{chain}/{address}     relay messages to claim, with proofs
+//! GET  /zones                       registered zones
 //! POST /tx                          hex-encoded signed transaction
 
 use crate::codec::{Tx, Wire};
@@ -91,6 +93,27 @@ async fn block(State(e): State<Shared>, Path((chain, height)): Path<(String, u64
         .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "no such block" }))))
 }
 
+async fn inbox(State(e): State<Shared>, Path((chain, addr)): Path<(String, String)>) -> Reply {
+    let (c, a) = parse(&chain, &addr)?;
+    let e = e.lock().unwrap();
+    let items: Vec<Value> = e
+        .inbox(c, &a)
+        .iter()
+        .map(|ri| {
+            json!({
+                "from": chain_slug(ri.msg.src), "amount": ri.msg.out.amount,
+                "asset": hex::encode(ri.msg.out.asset), "source_height": ri.header.height,
+                "proof_bytes": ri.to_bytes().len(), "proof": hex::encode(ri.to_bytes()),
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+async fn zones(State(e): State<Shared>) -> Json<Value> {
+    Json(e.lock().unwrap().status_json()["zones"].clone())
+}
+
 async fn submit(State(e): State<Shared>, body: String) -> Reply {
     let bytes = hex::decode(body.trim()).map_err(|err| bad(err.to_string()))?;
     let tx = Tx::from_bytes(&bytes).map_err(bad)?;
@@ -107,6 +130,8 @@ pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
         .route("/utxos/{chain}/{addr}", get(utxos))
         .route("/atomic/{chain}/{addr}", get(atomic))
         .route("/block/{chain}/{height}", get(block))
+        .route("/inbox/{chain}/{addr}", get(inbox))
+        .route("/zones", get(zones))
         .route("/tx", post(submit))
         .with_state(engine);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("rpc {addr}: {e}"))?;

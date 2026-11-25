@@ -146,7 +146,7 @@ pub fn sampled_quorum(voters: &[Voter], n_candidates: usize, p: Params) -> Outco
 // ───────────────────────── finality certificates ─────────────────────────
 
 pub fn vote_msg(chain: ChainId, height: u64, block: &Hash) -> Hash {
-    Enc::new("pqchain/vote").u8(chain.tag()).u64(height).bytes(block).hash()
+    Enc::new("pqchain/vote").u64(chain.code()).u64(height).bytes(block).hash()
 }
 
 /// After acceptance, validators sign the block hash. A certificate with more

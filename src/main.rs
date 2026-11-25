@@ -123,6 +123,24 @@ enum WalletCmd {
         #[arg(long)]
         amount: u64,
     },
+    /// Register a zone (application chain) validated by the given primary validators.
+    CreateZone {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        name: String,
+        /// Comma-separated validator node ids (pq1...).
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<String>,
+    },
+    /// Claim relay messages (transfers from/to zones) addressed to you on a chain.
+    RelayImport {
+        #[arg(long)]
+        key: PathBuf,
+        /// Receiving chain: atbash or zone-N.
+        #[arg(long)]
+        chain: String,
+    },
     /// Start a validator's exit (signed by its cold withdrawal key).
     Exit {
         /// Withdrawal key file of the validator.
@@ -239,6 +257,17 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
             let k = if cold { Keypair::generate_slh() } else { Keypair::generate() };
             node::save_key(&out, &k)?;
             println!("{}  {} (saved to {})", k.address().to_text(), pqchain::crypto::alg_name(k.alg()), out.display());
+        }
+        WalletCmd::CreateZone { key, name, members } => {
+            let k = node::load_key(&key)?;
+            let members = members.iter().map(|m| Address::from_text(m)).collect::<Result<Vec<_>, _>>()?;
+            submit(&c, wallet::create_zone(&c, &k, &name, members)?)?;
+        }
+        WalletCmd::RelayImport { key, chain } => {
+            let k = node::load_key(&key)?;
+            let (tx, amount) = wallet::relay_import(&c, &k, chain_from_str(&chain)?)?;
+            println!("claiming {amount} (proofs verified by the receiving chain)");
+            submit(&c, tx)?;
         }
         WalletCmd::Exit { withdrawal_key, node } => {
             let k = node::load_key(&withdrawal_key)?;

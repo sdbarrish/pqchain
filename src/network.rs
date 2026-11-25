@@ -142,6 +142,7 @@ pub fn select_native(
     let pool = match source {
         Source::Local => l.utxos_of(chain, owner),
         Source::Atomic => l.atomic_of(chain, owner),
+        Source::Relay => Vec::new(),
     };
     select_from_pool(pool, need)
 }
@@ -177,6 +178,7 @@ pub fn native_transfer(
     let pool = match source {
         Source::Local => l.utxos_of(chain, &from.address()),
         Source::Atomic => l.atomic_of(chain, &from.address()),
+        Source::Relay => Vec::new(),
     };
     native_transfer_from_pool(pool, source, from, outputs, export, locked)
 }

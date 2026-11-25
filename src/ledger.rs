@@ -1,9 +1,15 @@
-//! Ledger for the primary network: Atbash Chain (UTXO assets) and Kerckhoffs Chain
-//! (platform: staking, validators, slashing), linked by
-//! "atomic memory" for cross-chain export/import.
+//! Ledger: the primary network's Atbash Chain (UTXO assets) and Kerckhoffs
+//! Chain (staking, validators, slashing, zone registry), plus zones
+//! (application chains validated by a subset of primary validators).
+//!
+//! Cross-chain value moves two ways:
+//! * Atbash <-> Kerckhoffs: "atomic memory" (both validated by everyone).
+//! * Anything involving a zone: relay messages, proven by the source block's
+//!   finality certificate plus a Merkle inclusion proof.
 
+use crate::consensus::{FinalityCert, LightClient};
 use crate::crypto::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub type ValidatorSet = BTreeMap<Address, Validator>;
@@ -18,26 +24,53 @@ pub const MAX_DELEGATION_FACTOR: u64 = 5;
 /// Kerckhoffs blocks between a validator's exit request and the release of
 /// its stake. During this window the validator can still be slashed.
 pub const UNBONDING_BLOCKS: u64 = 10;
+/// Fee (burned) for registering a zone.
+pub const ZONE_FEE: u64 = 100;
+pub const MAX_ZONE_MEMBERS: usize = 64;
+
+static EMPTY_UTXOS: BTreeMap<OutPoint, TxOut> = BTreeMap::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChainId {
     Kerckhoffs,
     Atbash,
+    /// Application chain registered on the Kerckhoffs Chain.
+    Zone(u32),
 }
 
 impl ChainId {
-    pub fn tag(self) -> u8 {
+    /// Stable numeric code used in hashes and on the wire.
+    pub fn code(self) -> u64 {
         match self {
             ChainId::Kerckhoffs => 0,
             ChainId::Atbash => 1,
+            ChainId::Zone(n) => 2 + n as u64,
         }
     }
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> String {
         match self {
-            ChainId::Kerckhoffs => "Kerckhoffs Chain",
-            ChainId::Atbash => "Atbash Chain",
+            ChainId::Kerckhoffs => "Kerckhoffs Chain".into(),
+            ChainId::Atbash => "Atbash Chain".into(),
+            ChainId::Zone(n) => format!("Zone {n}"),
         }
     }
+    pub fn is_zone(self) -> bool {
+        matches!(self, ChainId::Zone(_))
+    }
+    /// Signature context for transactions on this chain (domain separation:
+    /// a signature for one chain is never valid on another).
+    pub fn tx_context(self) -> Vec<u8> {
+        match self {
+            ChainId::Kerckhoffs => ctx::KERCKHOFFS_TX.to_vec(),
+            ChainId::Atbash => ctx::ATBASH_TX.to_vec(),
+            ChainId::Zone(n) => format!("pqchain/v2/zone/{n}/tx").into_bytes(),
+        }
+    }
+}
+
+/// Transfers involving a zone travel as relay messages, not atomic memory.
+pub fn needs_relay(src: ChainId, dest: ChainId) -> bool {
+    src.is_zone() || dest.is_zone()
 }
 
 // ───────────────────────────── transactions ─────────────────────────────
@@ -64,12 +97,48 @@ impl TxOut {
     }
 }
 
-/// Where an input comes from: this chain's UTXO set, or atomic memory
-/// (funds exported to this chain by another chain).
+/// Where an input comes from: this chain's UTXO set, atomic memory (funds
+/// exported between the primary chains), or a proven relay message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Local,
     Atomic,
+    Relay,
+}
+
+/// A cross-chain transfer emitted by a block (an exported output whose
+/// route involves a zone).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayMsg {
+    pub src: ChainId,
+    pub dest: ChainId,
+    pub txid: Hash,
+    pub index: u32,
+    pub out: TxOut,
+}
+
+impl RelayMsg {
+    pub fn hash(&self) -> Hash {
+        let mut e = Enc::new("pqchain/relay-msg");
+        e.u64(self.src.code()).u64(self.dest.code()).bytes(&self.txid).u64(self.index as u64);
+        self.out.encode(&mut e);
+        e.hash()
+    }
+    pub fn outpoint(&self) -> OutPoint {
+        OutPoint { txid: self.txid, index: self.index }
+    }
+}
+
+/// Self-contained proof that a relay message was emitted by a finalized
+/// block on its source chain: the block header, its finality certificate,
+/// and a Merkle path from the message to the header's `msg_root`.
+#[derive(Clone, Debug)]
+pub struct RelayIn {
+    pub msg: RelayMsg,
+    pub header: BlockHeader,
+    pub cert: FinalityCert,
+    pub leaf: u32,
+    pub branch: Vec<Hash>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,9 +154,11 @@ pub struct TxIn {
 pub struct Transfer {
     pub inputs: Vec<TxIn>,
     pub outputs: Vec<TxOut>,
-    /// Outputs sent to another chain via atomic memory.
+    /// Outputs sent to another chain (atomic memory or relay message).
     pub export_to: Option<ChainId>,
     pub exported: Vec<TxOut>,
+    /// Proofs for inputs with `Source::Relay`.
+    pub relay_in: Vec<RelayIn>,
 }
 
 impl Transfer {
@@ -105,10 +176,16 @@ impl Transfer {
         for o in &self.outputs {
             o.encode(e);
         }
-        e.u8(self.export_to.map_or(255, |c| c.tag()));
+        e.u64(self.export_to.map_or(u64::MAX, |c| c.code()));
         e.u64(self.exported.len() as u64);
         for o in &self.exported {
             o.encode(e);
+        }
+        // Commit to which messages are claimed; proofs themselves are not
+        // part of the txid (a proof can be refreshed without re-signing).
+        e.u64(self.relay_in.len() as u64);
+        for r in &self.relay_in {
+            e.bytes(&r.msg.hash());
         }
     }
 
@@ -127,6 +204,7 @@ impl Transfer {
             outputs,
             export_to: None,
             exported: Vec::new(),
+            relay_in: Vec::new(),
         }
     }
 
@@ -174,9 +252,15 @@ impl AtbashTx {
         Some(Enc::new("pqchain/asset").bytes(&first.prev.txid).u64(first.prev.index as u64).hash())
     }
 
-    pub fn sign(mut self, keys: &[&Keypair]) -> Self {
+    /// Sign for the Atbash Chain.
+    pub fn sign(self, keys: &[&Keypair]) -> Self {
+        self.sign_for(ChainId::Atbash, keys)
+    }
+
+    /// Sign for a specific UTXO chain (Atbash or a zone).
+    pub fn sign_for(mut self, chain: ChainId, keys: &[&Keypair]) -> Self {
         let id = self.id();
-        self.base.sign_all(ctx::ATBASH_TX, &id, keys);
+        self.base.sign_all(&chain.tx_context(), &id, keys);
         self
     }
 }
@@ -203,6 +287,8 @@ pub enum KerckhoffsKind {
     /// validator's cold withdrawal address (typically SLH-DSA). Stake is
     /// released to that address after `UNBONDING_BLOCKS`.
     Exit { node: Address, authority: PublicKey, sig: Signature },
+    /// Register a zone validated by the listed primary validators.
+    CreateZone { name: String, members: Vec<Address> },
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +321,13 @@ impl KerckhoffsTx {
             // The exit signature itself is excluded so it can sign the txid.
             KerckhoffsKind::Exit { node, authority, .. } => {
                 e.u8(4).bytes(&node.0).u8(authority.alg).bytes(&authority.bytes)
+            }
+            KerckhoffsKind::CreateZone { name, members } => {
+                e.u8(5).bytes(name.as_bytes()).u64(members.len() as u64);
+                for m in members {
+                    e.bytes(&m.0);
+                }
+                &mut e
             }
         };
         e.hash()
@@ -280,12 +373,14 @@ pub struct BlockHeader {
     /// Kerckhoffs Chain height whose validator set governs this block. Makes
     /// validity independent of the order in which chains are accepted.
     pub anchor: u64,
+    /// Merkle root of the relay messages this block emits.
+    pub msg_root: Hash,
 }
 
 impl BlockHeader {
     pub fn hash(&self) -> Hash {
         Enc::new("pqchain/block-header")
-            .u8(self.chain.tag())
+            .u64(self.chain.code())
             .u64(self.height)
             .bytes(&self.parent)
             .bytes(&self.tx_root)
@@ -293,10 +388,12 @@ impl BlockHeader {
             .u64(self.timestamp)
             .u64(self.round as u64)
             .u64(self.anchor)
+            .bytes(&self.msg_root)
             .hash()
     }
 }
 
+/// Block body. `Atbash` is the UTXO body used by the Atbash Chain and by zones.
 #[derive(Clone, Debug)]
 pub enum Body {
     Atbash(Vec<AtbashTx>),
@@ -334,6 +431,42 @@ impl Block {
     pub fn header(&self) -> &BlockHeader {
         &self.signed.header
     }
+
+    /// Relay messages emitted by this block, in order.
+    pub fn messages(&self) -> Vec<RelayMsg> {
+        body_messages(self.signed.header.chain, &self.body)
+    }
+}
+
+pub fn body_messages(src: ChainId, body: &Body) -> Vec<RelayMsg> {
+    let mut msgs = Vec::new();
+    if let Body::Atbash(txs) = body {
+        for tx in txs {
+            let Some(dest) = tx.base.export_to else { continue };
+            if !needs_relay(src, dest) {
+                continue;
+            }
+            let txid = tx.id();
+            for (j, out) in tx.base.exported.iter().enumerate() {
+                let index = (tx.base.outputs.len() + j) as u32;
+                msgs.push(RelayMsg { src, dest, txid, index, out: out.clone() });
+            }
+        }
+    }
+    msgs
+}
+
+pub fn msg_root(msgs: &[RelayMsg]) -> Hash {
+    merkle_root(&msgs.iter().map(RelayMsg::hash).collect::<Vec<_>>())
+}
+
+/// A registered zone. Membership is fixed at creation in v2.
+#[derive(Clone, Debug)]
+pub struct Zone {
+    pub id: u32,
+    pub name: String,
+    pub members: Vec<Address>,
+    pub created_at: u64,
 }
 
 // ───────────────────────────── state ─────────────────────────────
@@ -384,6 +517,10 @@ pub struct Ledger {
     pub tips: BTreeMap<ChainId, (u64, Hash)>,
     /// Anchor of the last accepted block on each chain (must not go backwards).
     pub anchors: BTreeMap<ChainId, u64>,
+    pub zones: BTreeMap<u32, Zone>,
+    pub zone_utxos: BTreeMap<u32, BTreeMap<OutPoint, TxOut>>,
+    /// Relay messages already claimed: (source chain, outpoint).
+    pub relay_consumed: BTreeSet<(ChainId, OutPoint)>,
 }
 
 pub struct GenesisValidator {
@@ -415,15 +552,43 @@ impl Ledger {
             );
         }
         for c in [ChainId::Kerckhoffs, ChainId::Atbash] {
-            l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u8(c.tag()).hash()));
+            l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u64(c.code()).hash()));
             l.anchors.insert(c, 0);
         }
         l.validator_history.insert(0, Arc::new(l.validators.clone()));
         l
     }
 
+    /// Tip of a chain; (0, zero hash) for a chain this ledger does not know.
     pub fn tip(&self, chain: ChainId) -> (u64, Hash) {
-        self.tips[&chain]
+        self.tips.get(&chain).copied().unwrap_or((0, [0; 32]))
+    }
+
+    /// Every chain this ledger tracks: the two primary chains plus zones.
+    pub fn chains(&self) -> Vec<ChainId> {
+        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash];
+        v.extend(self.zones.keys().map(|n| ChainId::Zone(*n)));
+        v
+    }
+
+    pub fn knows(&self, chain: ChainId) -> bool {
+        self.tips.contains_key(&chain)
+    }
+
+    /// Validators of `chain` as of a Kerckhoffs height: all primary
+    /// validators for the primary chains, the members for a zone.
+    pub fn chain_validators(&self, chain: ChainId, anchor: u64) -> Option<ValidatorSet> {
+        let set = self.validators_at(anchor)?;
+        match chain {
+            ChainId::Kerckhoffs | ChainId::Atbash => Some(set.clone()),
+            ChainId::Zone(n) => {
+                let z = self.zones.get(&n)?;
+                if z.created_at > anchor {
+                    return None;
+                }
+                Some(set.iter().filter(|(a, _)| z.members.contains(a)).map(|(a, v)| (*a, v.clone())).collect())
+            }
+        }
     }
 
     pub fn total_weight(&self) -> u64 {
@@ -470,13 +635,42 @@ impl Ledger {
         match chain {
             ChainId::Kerckhoffs => &self.kerckhoffs_utxos,
             ChainId::Atbash => &self.atbash_utxos,
+            ChainId::Zone(n) => self.zone_utxos.get(&n).unwrap_or(&EMPTY_UTXOS),
         }
     }
     fn utxos_mut(&mut self, chain: ChainId) -> &mut BTreeMap<OutPoint, TxOut> {
         match chain {
             ChainId::Kerckhoffs => &mut self.kerckhoffs_utxos,
             ChainId::Atbash => &mut self.atbash_utxos,
+            ChainId::Zone(n) => self.zone_utxos.entry(n).or_default(),
         }
+    }
+
+    /// Check a relay proof for delivery to `dest`. Depends only on the
+    /// proof and the validator registry, not on the source chain's state.
+    pub fn verify_relay(&self, dest: ChainId, ri: &RelayIn) -> Result<(), String> {
+        let (m, h) = (&ri.msg, &ri.header);
+        if m.dest != dest {
+            return Err("relay message is addressed to another chain".into());
+        }
+        if m.src == dest || !needs_relay(m.src, m.dest) {
+            return Err("not a relay route".into());
+        }
+        if h.chain != m.src {
+            return Err("proof header is from the wrong chain".into());
+        }
+        if ri.cert.chain != h.chain || ri.cert.height != h.height || ri.cert.block != h.hash() {
+            return Err("finality certificate does not match the header".into());
+        }
+        if h.anchor > self.current_anchor() {
+            return Err("relay proof anchor is ahead of the local Kerckhoffs tip (retry later)".into());
+        }
+        let set = self.chain_validators(h.chain, h.anchor).ok_or("source chain unknown at proof anchor")?;
+        LightClient::from_validators(&set).verify(&ri.cert).map_err(|e| format!("relay certificate: {e}"))?;
+        if !merkle_verify(&m.hash(), ri.leaf, &ri.branch, &h.msg_root) {
+            return Err("relay message is not included in the source block".into());
+        }
+        Ok(())
     }
 
     /// Deterministic, stake-weighted leader schedule for (height, round),
@@ -489,13 +683,13 @@ impl Ledger {
         round: u32,
         anchor: u64,
     ) -> Option<Address> {
-        let set = self.validators_at(anchor)?;
+        let set = self.chain_validators(chain, anchor)?;
         let total: u64 = set.values().map(Validator::weight).sum();
         if total == 0 {
             return None;
         }
         let seed = Enc::new("pqchain/leader")
-            .u8(chain.tag())
+            .u64(chain.code())
             .u64(height)
             .bytes(parent)
             .u64(round as u64)
@@ -520,17 +714,33 @@ impl Ledger {
         context: &[u8],
     ) -> Result<BTreeMap<AssetId, u128>, String> {
         let mut totals = BTreeMap::new();
+        let relay_inputs = t.inputs.iter().filter(|i| i.source == Source::Relay).count();
+        if relay_inputs != t.relay_in.len() {
+            return Err("every relay proof must back exactly one relay input".into());
+        }
         for inp in &t.inputs {
             let out = match inp.source {
                 Source::Local => self.utxos_mut(chain).remove(&inp.prev),
                 Source::Atomic => self.atomic.remove(&(chain, inp.prev)),
+                Source::Relay => {
+                    let ri = t
+                        .relay_in
+                        .iter()
+                        .find(|r| r.msg.outpoint() == inp.prev)
+                        .ok_or("relay input without a matching proof")?;
+                    self.verify_relay(chain, ri)?;
+                    if !self.relay_consumed.insert((ri.msg.src, inp.prev)) {
+                        return Err("relay message already claimed (double-spend)".into());
+                    }
+                    Some(ri.msg.out.clone())
+                }
             }
             .ok_or("input missing or already spent (double-spend)")?;
             if inp.pubkey.address() != out.owner {
                 return Err("public key does not match the output's owner".into());
             }
             if !inp.pubkey.verify(context, txid, &inp.sig) {
-                return Err("invalid ML-DSA signature".into());
+                return Err("invalid transaction signature".into());
             }
             *totals.entry(out.asset).or_insert(0u128) += out.amount as u128;
         }
@@ -546,7 +756,17 @@ impl Ledger {
         let mut totals = BTreeMap::new();
         match (t.export_to, t.exported.is_empty()) {
             (None, true) => {}
-            (Some(dest), false) if dest != chain => {}
+            (Some(dest), false) if dest != chain => {
+                if matches!(
+                    (chain, dest),
+                    (ChainId::Kerckhoffs, ChainId::Zone(_)) | (ChainId::Zone(_), ChainId::Kerckhoffs)
+                ) {
+                    return Err("zones exchange value with the Atbash Chain and other zones, not Kerckhoffs".into());
+                }
+                if !self.knows(dest) {
+                    return Err("export to an unknown chain".into());
+                }
+            }
             _ => return Err("bad export: needs a different destination chain and outputs".into()),
         }
         for (i, o) in t.outputs.iter().chain(&t.exported).enumerate() {
@@ -557,7 +777,10 @@ impl Ledger {
             if i < t.outputs.len() {
                 self.utxos_mut(chain).insert(op, o.clone());
             } else {
-                self.atomic.insert((t.export_to.unwrap(), op), o.clone());
+                let dest = t.export_to.unwrap();
+                if !needs_relay(chain, dest) {
+                    self.atomic.insert((dest, op), o.clone());
+                } // else: carried by a relay message committed in the block's msg_root
             }
             *totals.entry(o.asset).or_insert(0u128) += o.amount as u128;
         }
@@ -565,12 +788,20 @@ impl Ledger {
     }
 
     pub fn apply_atbash(&mut self, tx: &AtbashTx) -> Result<(), String> {
+        self.apply_utxo(ChainId::Atbash, tx)
+    }
+
+    /// Apply a UTXO transaction on the Atbash Chain or a zone.
+    pub fn apply_utxo(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
+        if chain == ChainId::Kerckhoffs || !self.knows(chain) {
+            return Err(format!("{} does not take UTXO transactions", chain.name()));
+        }
         let id = tx.id();
         if tx.base.inputs.is_empty() {
             return Err("transaction has no inputs".into());
         }
-        let ins = self.spend_inputs(ChainId::Atbash, &tx.base, &id, ctx::ATBASH_TX)?;
-        let outs = self.create_outputs(ChainId::Atbash, &tx.base, &id)?;
+        let ins = self.spend_inputs(chain, &tx.base, &id, &chain.tx_context())?;
+        let outs = self.create_outputs(chain, &tx.base, &id)?;
         let new_asset = tx.new_asset_id();
         let get = |m: &BTreeMap<AssetId, u128>, a: &AssetId| m.get(a).copied().unwrap_or(0);
 
@@ -604,6 +835,7 @@ impl Ledger {
         let (stake, fee) = match &tx.kind {
             // Reporting misbehaviour is free; an exit is authorized by its signature.
             KerckhoffsKind::Slash { .. } | KerckhoffsKind::Exit { .. } => (0, 0),
+            KerckhoffsKind::CreateZone { .. } => (0, ZONE_FEE),
             KerckhoffsKind::AddValidator { stake, .. } | KerckhoffsKind::AddDelegator { stake, .. } => (*stake, TX_FEE),
             KerckhoffsKind::Transfer => (0, TX_FEE),
         };
@@ -682,6 +914,29 @@ impl Ledger {
                 }
                 v.exit_at = Some(release);
             }
+            KerckhoffsKind::CreateZone { name, members } => {
+                if name.is_empty() || name.len() > 32 {
+                    return Err("zone name must be 1-32 bytes".into());
+                }
+                if members.is_empty() || members.len() > MAX_ZONE_MEMBERS {
+                    return Err(format!("a zone needs 1-{MAX_ZONE_MEMBERS} members"));
+                }
+                let distinct: BTreeSet<_> = members.iter().collect();
+                if distinct.len() != members.len() {
+                    return Err("duplicate zone member".into());
+                }
+                for m in members {
+                    if !self.validators.get(m).is_some_and(|v| v.weight() > 0) {
+                        return Err(format!("zone member {m} is not an active primary validator"));
+                    }
+                }
+                let id = self.zones.keys().next_back().map_or(0, |n| n + 1);
+                let created_at = self.tip(ChainId::Kerckhoffs).0 + 1;
+                let chain = ChainId::Zone(id);
+                self.zones.insert(id, Zone { id, name: name.clone(), members: members.clone(), created_at });
+                self.tips.insert(chain, (0, Enc::new("pqchain/genesis-block").u64(chain.code()).hash()));
+                self.anchors.insert(chain, created_at);
+            }
         }
         Ok(())
     }
@@ -752,15 +1007,18 @@ impl Ledger {
             ChainId::Kerckhoffs if h.anchor != k_tip => {
                 return Err("Kerckhoffs block must anchor to its parent height".into())
             }
-            ChainId::Atbash if h.anchor > k_tip => {
+            ChainId::Atbash | ChainId::Zone(_) if h.anchor > k_tip => {
                 return Err("anchor is ahead of the local Kerckhoffs tip (retry later)".into())
             }
-            ChainId::Atbash if h.anchor < self.anchors[&ChainId::Atbash] => {
+            ChainId::Atbash | ChainId::Zone(_) if h.anchor < self.anchors.get(&h.chain).copied().unwrap_or(0) => {
                 return Err("anchor went backwards".into())
             }
             _ => {}
         }
-        let set = self.validators_at(h.anchor).ok_or("no validator set at anchor")?;
+        if !self.knows(h.chain) {
+            return Err("unknown chain (retry later)".into());
+        }
+        let set = self.chain_validators(h.chain, h.anchor).ok_or("no validator set at anchor")?;
         let v = set
             .get(&h.proposer)
             .filter(|v| !v.slashed)
@@ -780,10 +1038,13 @@ impl Ledger {
         if merkle_root(&b.body.tx_ids()) != h.tx_root {
             return Err("tx root mismatch".into());
         }
+        if msg_root(&b.messages()) != h.msg_root {
+            return Err("relay message root mismatch".into());
+        }
         match (&b.body, h.chain) {
-            (Body::Atbash(txs), ChainId::Atbash) => {
+            (Body::Atbash(txs), ChainId::Atbash | ChainId::Zone(_)) => {
                 for (i, t) in txs.iter().enumerate() {
-                    self.apply_atbash(t).map_err(|e| format!("tx {i}: {e}"))?;
+                    self.apply_utxo(h.chain, t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
             (Body::Kerckhoffs(txs), ChainId::Kerckhoffs) => {
@@ -814,14 +1075,31 @@ impl Ledger {
         }
         e.u64(self.atomic.len() as u64);
         for ((c, p), o) in &self.atomic {
-            e.u8(c.tag()).bytes(&p.txid).u64(p.index as u64);
+            e.u64(c.code()).bytes(&p.txid).u64(p.index as u64);
             o.encode(&mut e);
+        }
+        for z in self.zones.values() {
+            e.u64(z.id as u64).bytes(z.name.as_bytes()).u64(z.created_at);
+            for m in &z.members {
+                e.bytes(&m.0);
+            }
+        }
+        for (n, m) in self.zone_utxos.iter().filter(|(_, m)| !m.is_empty()) {
+            e.u64(*n as u64).u64(m.len() as u64);
+            for (p, o) in m {
+                e.bytes(&p.txid).u64(p.index as u64);
+                o.encode(&mut e);
+            }
+        }
+        e.u64(self.relay_consumed.len() as u64);
+        for (c, p) in &self.relay_consumed {
+            e.u64(c.code()).bytes(&p.txid).u64(p.index as u64);
         }
         for v in self.validators.values() {
             e.bytes(&v.node_id.0).u64(v.stake).u64(v.delegated).u8(v.slashed as u8).u64(v.exit_at.unwrap_or(0));
         }
         for (c, (h, hash)) in &self.tips {
-            e.u8(c.tag()).u64(*h).bytes(hash).u64(self.anchors[c]);
+            e.u64(c.code()).u64(*h).bytes(hash).u64(self.anchors.get(c).copied().unwrap_or(0));
         }
         e.u64(self.burned);
         e.hash()
@@ -839,6 +1117,11 @@ pub fn propose_round(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64,
         Body::Atbash(_) => ChainId::Atbash,
         Body::Kerckhoffs(_) => ChainId::Kerckhoffs,
     };
+    propose_on(ledger, key, chain, body, timestamp, round)
+}
+
+/// Build and sign a block for any chain (zones use an Atbash-style body).
+pub fn propose_on(ledger: &Ledger, key: &Keypair, chain: ChainId, body: Body, timestamp: u64, round: u32) -> Block {
     let (h, parent) = ledger.tip(chain);
     let header = BlockHeader {
         chain,
@@ -849,6 +1132,7 @@ pub fn propose_round(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64,
         timestamp,
         round,
         anchor: ledger.current_anchor(),
+        msg_root: msg_root(&body_messages(chain, &body)),
     };
     let sig = key.sign(ctx::BLOCK, &header.hash());
     Block { signed: SignedHeader { header, sig }, body }

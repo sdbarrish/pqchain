@@ -20,3 +20,6 @@ ureq = "2"
 wasmi = "1"
 wat = "1.263.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

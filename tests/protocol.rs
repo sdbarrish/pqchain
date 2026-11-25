@@ -107,3 +107,19 @@ fn light_client_rejects_minority_and_forged_votes() {
     c.votes[0].1.bytes[5] ^= 1;
     assert!(lc.verify(&c).is_err());
 }
+
+/// Regression (found by the `supply` fuzzer): a transaction rejected late in
+/// validation (here, a delegation over the 5x cap) must leave no partial
+/// effects behind: inputs unspent, nothing burned.
+#[test]
+fn rejected_transactions_leave_no_partial_effects() {
+    let (vals, a, _, mut l) = setup();
+    l.kerckhoffs_utxos.insert(OutPoint { txid: [9; 32], index: 0 }, TxOut::native(a.address(), 900_000));
+    let before = l.state_root();
+    let (base, n) = native_transfer(&l, ChainId::Kerckhoffs, Source::Local, &a, vec![], None, 60_000).unwrap();
+    let kind = KerckhoffsKind::AddDelegator { node: vals[0].address(), stake: 60_000, reward: a.address() };
+    let tx = KerckhoffsTx { base, kind }.sign(&vec![&a; n]);
+    assert!(l.apply_kerckhoffs(&tx).unwrap_err().contains("cap"));
+    assert_eq!(l.state_root(), before, "state changed by a rejected transaction");
+    assert_eq!(l.burned, 0);
+}

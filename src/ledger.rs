@@ -8,7 +8,7 @@
 //!   finality certificate plus a Merkle inclusion proof.
 
 use crate::consensus::{FinalityCert, LightClient};
-use crate::feistel::{self, Action, FeistelState, FeistelTx, Receipt, BASE_FEE, FUEL_PER_FEE_UNIT, MAX_FUEL};
+use crate::feistel::{self, Action, FeistelState, FeistelTx, Receipt, BASE_FEE, MAX_FUEL};
 use crate::crypto::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -523,9 +523,35 @@ impl Validator {
         if self.slashed || self.exit_at.is_some() {
             0
         } else {
-            self.stake + self.delegated
+            self.stake.saturating_add(self.delegated)
         }
     }
+}
+
+/// Per-validator shares of one block's reward, proportional to weight.
+/// Rounds down, so the sum never exceeds `BLOCK_REWARD` (proved with Kani).
+pub(crate) fn reward_shares(weights: &[u64]) -> Vec<u128> {
+    let total: u128 = weights.iter().map(|w| *w as u128).sum();
+    if total == 0 {
+        return vec![0; weights.len()];
+    }
+    weights.iter().map(|w| BLOCK_REWARD as u128 * *w as u128 / total).collect()
+}
+
+/// Split a validator's share between itself (own stake + commission) and its
+/// delegators (pro rata). Requires `stake <= weight`. Never pays out more than
+/// `share` (proved with Kani).
+pub(crate) fn split_validator_reward(share: u128, stake: u64, weight: u64, delegations: &[u64]) -> (u128, Vec<u128>) {
+    if weight == 0 {
+        return (0, vec![0; delegations.len()]);
+    }
+    let own = share * stake as u128 / weight as u128;
+    let to_delegators = share - own;
+    let fee = to_delegators * DELEGATION_FEE_BPS as u128 / 10_000;
+    let pool = to_delegators - fee;
+    let dsum: u128 = delegations.iter().map(|d| *d as u128).sum();
+    let parts = delegations.iter().map(|d| if dsum == 0 { 0 } else { pool * *d as u128 / dsum }).collect();
+    (own + fee, parts)
 }
 
 #[derive(Clone, Debug)]
@@ -843,6 +869,10 @@ impl Ledger {
     /// execution fails is still included: its effects are rolled back, but it
     /// consumes its nonce and pays for the fuel it used.
     pub fn apply_feistel(&mut self, tx: &FeistelTx) -> Result<Receipt, String> {
+        self.atomically(|l| l.apply_feistel_inner(tx))
+    }
+
+    fn apply_feistel_inner(&mut self, tx: &FeistelTx) -> Result<Receipt, String> {
         let id = tx.id();
         let sender = tx.sender();
         if !tx.from.verify(ctx::FEISTEL_TX, &id, &tx.sig) {
@@ -905,7 +935,7 @@ impl Ledger {
                 }
             }
         };
-        let fee = BASE_FEE + receipt.fuel_used.div_ceil(FUEL_PER_FEE_UNIT);
+        let fee = feistel::fee_for_fuel(receipt.fuel_used);
         self.feistel.debit_pub(&sender, fee)?;
         self.burned += fee;
         let receipt = Receipt { fee, ..receipt };
@@ -918,6 +948,10 @@ impl Ledger {
 
     /// Apply a UTXO transaction on the Atbash Chain or a zone.
     pub fn apply_utxo(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
+        self.atomically(|l| l.apply_utxo_inner(chain, tx))
+    }
+
+    fn apply_utxo_inner(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
         if matches!(chain, ChainId::Kerckhoffs | ChainId::Feistel) || !self.knows(chain) {
             return Err(format!("{} does not take UTXO transactions", chain.name()));
         }
@@ -949,6 +983,19 @@ impl Ledger {
     }
 
     pub fn apply_kerckhoffs(&mut self, tx: &KerckhoffsTx) -> Result<(), String> {
+        self.atomically(|l| l.apply_kerckhoffs_inner(tx))
+    }
+
+    /// Run `f` so that it either fully succeeds or leaves the ledger untouched.
+    /// (Block application gets the same guarantee once per block instead.)
+    fn atomically<T>(&mut self, f: impl FnOnce(&mut Ledger) -> Result<T, String>) -> Result<T, String> {
+        let mut next = self.clone();
+        let out = f(&mut next)?;
+        *self = next;
+        Ok(out)
+    }
+
+    fn apply_kerckhoffs_inner(&mut self, tx: &KerckhoffsTx) -> Result<(), String> {
         let id = tx.id();
         let ins = self.spend_inputs(ChainId::Kerckhoffs, &tx.base, &id, ctx::KERCKHOFFS_TX)?;
         let outs = self.create_outputs(ChainId::Kerckhoffs, &tx.base, &id)?;
@@ -1086,24 +1133,16 @@ impl Ledger {
     /// delegators, minus the validator's commission. Rounding dust is not issued.
     fn distribute_rewards(&mut self, chain: ChainId, anchor: u64) {
         let Some(set) = self.chain_validators(chain, anchor) else { return };
-        let total: u128 = set.values().map(|v| v.weight() as u128).sum();
-        if total == 0 {
-            return;
-        }
+        let active: Vec<&Validator> = set.values().filter(|v| v.weight() > 0).collect();
+        let shares = reward_shares(&active.iter().map(|v| v.weight()).collect::<Vec<_>>());
         let mut credits: Vec<(Address, u64)> = Vec::new();
-        for v in set.values().filter(|v| v.weight() > 0) {
-            let share = BLOCK_REWARD as u128 * v.weight() as u128 / total;
-            let own = share * v.stake as u128 / v.weight() as u128;
-            let to_delegators = share - own;
-            let fee = to_delegators * DELEGATION_FEE_BPS as u128 / 10_000;
-            let pool = to_delegators - fee;
+        for (v, share) in active.into_iter().zip(shares) {
             let ds: Vec<&Delegation> = self.delegations.iter().filter(|d| d.node == v.node_id).collect();
-            let dsum: u128 = ds.iter().map(|d| d.stake as u128).sum();
-            credits.push((v.withdrawal, (own + fee) as u64));
-            for d in ds {
-                if dsum > 0 {
-                    credits.push((d.reward, (pool * d.stake as u128 / dsum) as u64));
-                }
+            let stakes: Vec<u64> = ds.iter().map(|d| d.stake).collect();
+            let (mine, parts) = split_validator_reward(share, v.stake.min(v.weight()), v.weight(), &stakes);
+            credits.push((v.withdrawal, mine as u64));
+            for (d, amt) in ds.into_iter().zip(parts) {
+                credits.push((d.reward, amt as u64));
             }
         }
         for (a, amt) in credits.into_iter().filter(|(_, a)| *a > 0) {
@@ -1217,17 +1256,17 @@ impl Ledger {
         match (&b.body, h.chain) {
             (Body::Atbash(txs), ChainId::Atbash | ChainId::Zone(_)) => {
                 for (i, t) in txs.iter().enumerate() {
-                    self.apply_utxo(h.chain, t).map_err(|e| format!("tx {i}: {e}"))?;
+                    self.apply_utxo_inner(h.chain, t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
             (Body::Kerckhoffs(txs), ChainId::Kerckhoffs) => {
                 for (i, t) in txs.iter().enumerate() {
-                    self.apply_kerckhoffs(t).map_err(|e| format!("tx {i}: {e}"))?;
+                    self.apply_kerckhoffs_inner(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
             (Body::Feistel(txs), ChainId::Feistel) => {
                 for (i, t) in txs.iter().enumerate() {
-                    self.apply_feistel(t).map_err(|e| format!("tx {i}: {e}"))?;
+                    self.apply_feistel_inner(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
             _ => return Err("body does not match chain".into()),
@@ -1240,6 +1279,26 @@ impl Ledger {
             self.validator_history.insert(h.height, Arc::new(self.validators.clone()));
         }
         Ok(())
+    }
+
+    /// Every native token currently held anywhere in the state: UTXOs on all
+    /// chains, atomic memory, Feistel accounts and contracts, bonded stake,
+    /// delegations and unclaimed rewards. Relay messages in flight (exported
+    /// from or to a zone but not yet claimed) are not counted.
+    ///
+    /// Invariant: `native_held() + burned == genesis supply + minted`.
+    pub fn native_held(&self) -> u128 {
+        let native = |m: &BTreeMap<OutPoint, TxOut>| -> u128 {
+            m.values().filter(|o| o.asset == NATIVE).map(|o| o.amount as u128).sum()
+        };
+        native(&self.atbash_utxos)
+            + native(&self.kerckhoffs_utxos)
+            + self.zone_utxos.values().map(native).sum::<u128>()
+            + self.atomic.values().filter(|o| o.asset == NATIVE).map(|o| o.amount as u128).sum::<u128>()
+            + self.feistel.balances.values().map(|b| *b as u128).sum::<u128>()
+            + self.validators.values().filter(|v| !v.slashed).map(|v| v.stake as u128).sum::<u128>()
+            + self.delegations.iter().map(|d| d.stake as u128).sum::<u128>()
+            + self.rewards.values().map(|r| *r as u128).sum::<u128>()
     }
 
     /// Commitment to the entire state; replicas must agree on this.

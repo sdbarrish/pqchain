@@ -19,3 +19,6 @@ pub mod rpc;
 pub mod snapshot;
 pub mod transport;
 pub mod wallet;
+
+#[cfg(kani)]
+mod proofs;

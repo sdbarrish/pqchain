@@ -90,6 +90,12 @@ impl FeistelState {
     }
 }
 
+/// Fee for a given amount of fuel. Monotonic, so a transaction never pays
+/// more than its declared maximum (proved with Kani for all fuel <= MAX_FUEL).
+pub fn fee_for_fuel(fuel: u64) -> u64 {
+    BASE_FEE + fuel.div_ceil(FUEL_PER_FEE_UNIT)
+}
+
 pub fn contract_address(creator: &Address, nonce: u64) -> Address {
     Address(Enc::new("pqchain/feistel/contract").bytes(&creator.0).u64(nonce).hash())
 }
@@ -147,7 +153,7 @@ impl FeistelTx {
     }
 
     pub fn max_fee(&self) -> u64 {
-        BASE_FEE + self.max_fuel.div_ceil(FUEL_PER_FEE_UNIT)
+        fee_for_fuel(self.max_fuel)
     }
 }
 

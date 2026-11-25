@@ -17,6 +17,16 @@ use std::sync::Arc;
 const MAGIC: &[u8; 8] = b"PQSNAP01";
 const MAX_SNAPSHOT_ITEMS: u64 = 1 << 32;
 
+/// Keys must appear in strictly increasing order, so every state has exactly
+/// one encoding (no duplicates, no reordering).
+fn ordered<K: Ord + Clone>(prev: &mut Option<K>, k: K) -> DecodeResult<K> {
+    if prev.as_ref().is_some_and(|p| *p >= k) {
+        return Err("snapshot keys out of order or duplicated".into());
+    }
+    *prev = Some(k.clone());
+    Ok(k)
+}
+
 fn count(r: &mut Reader) -> DecodeResult<u64> {
     let n = r.u64()?;
     if n > MAX_SNAPSHOT_ITEMS {
@@ -34,9 +44,10 @@ fn put_utxos(w: &mut Writer, m: &BTreeMap<OutPoint, TxOut>) {
 }
 
 fn get_utxos(r: &mut Reader) -> DecodeResult<BTreeMap<OutPoint, TxOut>> {
-    let mut m = BTreeMap::new();
+    let (mut m, mut prev) = (BTreeMap::new(), None);
     for _ in 0..count(r)? {
-        m.insert(OutPoint::get(r)?, TxOut::get(r)?);
+        let k = ordered(&mut prev, OutPoint::get(r)?)?;
+        m.insert(k, TxOut::get(r)?);
     }
     Ok(m)
 }
@@ -80,10 +91,10 @@ fn put_set(w: &mut Writer, s: &ValidatorSet) {
 }
 
 fn get_set(r: &mut Reader) -> DecodeResult<ValidatorSet> {
-    let mut s = BTreeMap::new();
+    let (mut s, mut prev) = (BTreeMap::new(), None);
     for _ in 0..count(r)? {
         let v = get_validator(r)?;
-        s.insert(v.node_id, v);
+        s.insert(ordered(&mut prev, v.node_id)?, v);
     }
     Ok(s)
 }
@@ -97,9 +108,10 @@ fn put_amounts(w: &mut Writer, m: &BTreeMap<Address, u64>) {
 }
 
 fn get_amounts(r: &mut Reader) -> DecodeResult<BTreeMap<Address, u64>> {
-    let mut m = BTreeMap::new();
+    let (mut m, mut prev) = (BTreeMap::new(), None);
     for _ in 0..count(r)? {
-        m.insert(Address::get(r)?, r.u64()?);
+        let k = ordered(&mut prev, Address::get(r)?)?;
+        m.insert(k, r.u64()?);
     }
     Ok(m)
 }
@@ -177,14 +189,15 @@ pub fn decode(b: &[u8]) -> DecodeResult<(Ledger, u64)> {
     let mut r = Reader::new(b);
     let records = r.u64()?;
     let mut l = Ledger { atbash_utxos: get_utxos(&mut r)?, kerckhoffs_utxos: get_utxos(&mut r)?, ..Default::default() };
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        let c = ChainId::get(&mut r)?;
-        let p = OutPoint::get(&mut r)?;
-        l.atomic.insert((c, p), TxOut::get(&mut r)?);
+        let k = ordered(&mut prev, (ChainId::get(&mut r)?, OutPoint::get(&mut r)?))?;
+        l.atomic.insert(k, TxOut::get(&mut r)?);
     }
     l.validators = get_set(&mut r)?;
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        let h = r.u64()?;
+        let h = ordered(&mut prev, r.u64()?)?;
         l.validator_history.insert(h, Arc::new(get_set(&mut r)?));
     }
     for _ in 0..count(&mut r)? {
@@ -192,35 +205,41 @@ pub fn decode(b: &[u8]) -> DecodeResult<(Ledger, u64)> {
     }
     l.burned = r.u64()?;
     l.minted = r.u64()?;
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        let c = ChainId::get(&mut r)?;
+        let c = ordered(&mut prev, ChainId::get(&mut r)?)?;
         l.tips.insert(c, (r.u64()?, r.hash()?));
         l.anchors.insert(c, r.u64()?);
     }
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        let id = r.u32()?;
+        let id = ordered(&mut prev, r.u32()?)?;
         let z = Zone { id, name: String::get(&mut r)?, members: r.list()?, created_at: r.u64()? };
         l.zones.insert(id, z);
     }
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        let n = r.u32()?;
+        let n = ordered(&mut prev, r.u32()?)?;
         l.zone_utxos.insert(n, get_utxos(&mut r)?);
     }
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        l.relay_consumed.insert((ChainId::get(&mut r)?, OutPoint::get(&mut r)?));
+        l.relay_consumed.insert(ordered(&mut prev, (ChainId::get(&mut r)?, OutPoint::get(&mut r)?))?);
     }
     l.rewards = get_amounts(&mut r)?;
     l.claim_nonces = get_amounts(&mut r)?;
     let mut f = FeistelState { balances: get_amounts(&mut r)?, nonces: get_amounts(&mut r)?, ..Default::default() };
+    let mut prev = None;
     for _ in 0..count(&mut r)? {
-        let a = Address::get(&mut r)?;
+        let a = ordered(&mut prev, Address::get(&mut r)?)?;
         let n = r.u32()? as usize;
         let code: Vec<u8> = (0..n).map(|_| r.u8()).collect::<Result<_, _>>()?;
         let code_hash = r.hash()?;
         let creator = Address::get(&mut r)?;
-        let mut storage = BTreeMap::new();
+        let (mut storage, mut prev_key) = (BTreeMap::new(), None);
         for _ in 0..count(&mut r)? {
-            storage.insert(r.bytes()?, r.bytes()?);
+            let k = ordered(&mut prev_key, r.bytes()?)?;
+            storage.insert(k, r.bytes()?);
         }
         f.contracts.insert(a, Contract { code, code_hash, creator, storage });
     }

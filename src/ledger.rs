@@ -1,4 +1,4 @@
-//! Ledger for the primary network: Prism Chain (UTXO assets) and Keystone Chain
+//! Ledger for the primary network: Atbash Chain (UTXO assets) and Kerckhoffs Chain
 //! (platform: staking, validators, slashing), linked by
 //! "atomic memory" for cross-chain export/import.
 
@@ -15,21 +15,21 @@ pub const MAX_DELEGATION_FACTOR: u64 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChainId {
-    Keystone,
-    Prism,
+    Kerckhoffs,
+    Atbash,
 }
 
 impl ChainId {
     pub fn tag(self) -> u8 {
         match self {
-            ChainId::Keystone => 0,
-            ChainId::Prism => 1,
+            ChainId::Kerckhoffs => 0,
+            ChainId::Atbash => 1,
         }
     }
     pub fn name(self) -> &'static str {
         match self {
-            ChainId::Keystone => "Keystone Chain",
-            ChainId::Prism => "Prism Chain",
+            ChainId::Kerckhoffs => "Kerckhoffs Chain",
+            ChainId::Atbash => "Atbash Chain",
         }
     }
 }
@@ -142,16 +142,16 @@ pub struct AssetDef {
     pub supply: u64,
 }
 
-/// Prism Chain transaction: transfers, exports, and new-asset creation.
+/// Atbash Chain transaction: transfers, exports, and new-asset creation.
 #[derive(Clone, Debug)]
-pub struct PrismTx {
+pub struct AtbashTx {
     pub base: Transfer,
     pub create_asset: Option<AssetDef>,
 }
 
-impl PrismTx {
+impl AtbashTx {
     pub fn id(&self) -> Hash {
-        let mut e = Enc::new("pqchain/prism-tx");
+        let mut e = Enc::new("pqchain/atbash-tx");
         self.base.encode(&mut e);
         match &self.create_asset {
             None => e.u8(0),
@@ -170,7 +170,7 @@ impl PrismTx {
 
     pub fn sign(mut self, keys: &[&Keypair]) -> Self {
         let id = self.id();
-        self.base.sign_all(ctx::PRISM_TX, &id, keys);
+        self.base.sign_all(ctx::ATBASH_TX, &id, keys);
         self
     }
 }
@@ -183,7 +183,7 @@ pub struct SignedHeader {
 }
 
 #[derive(Clone, Debug)]
-pub enum KeystoneKind {
+pub enum KerckhoffsKind {
     /// Plain transfer / import from atomic memory.
     Transfer,
     /// Become a Tier-1 validator. `signing_key` is the hot ML-DSA block key;
@@ -196,27 +196,27 @@ pub enum KeystoneKind {
 }
 
 #[derive(Clone, Debug)]
-pub struct KeystoneTx {
+pub struct KerckhoffsTx {
     pub base: Transfer,
-    pub kind: KeystoneKind,
+    pub kind: KerckhoffsKind,
 }
 
-impl KeystoneTx {
+impl KerckhoffsTx {
     pub fn id(&self) -> Hash {
-        let mut e = Enc::new("pqchain/keystone-tx");
+        let mut e = Enc::new("pqchain/kerckhoffs-tx");
         self.base.encode(&mut e);
         match &self.kind {
-            KeystoneKind::Transfer => e.u8(0),
-            KeystoneKind::AddValidator { signing_key, withdrawal, stake } => e
+            KerckhoffsKind::Transfer => e.u8(0),
+            KerckhoffsKind::AddValidator { signing_key, withdrawal, stake } => e
                 .u8(1)
                 .u8(signing_key.alg)
                 .bytes(&signing_key.bytes)
                 .bytes(&withdrawal.0)
                 .u64(*stake),
-            KeystoneKind::AddDelegator { node, stake, reward } => {
+            KerckhoffsKind::AddDelegator { node, stake, reward } => {
                 e.u8(2).bytes(&node.0).u64(*stake).bytes(&reward.0)
             }
-            KeystoneKind::Slash { a, b } => e
+            KerckhoffsKind::Slash { a, b } => e
                 .u8(3)
                 .bytes(&a.header.hash())
                 .bytes(&a.sig.bytes)
@@ -228,7 +228,7 @@ impl KeystoneTx {
 
     pub fn sign(mut self, keys: &[&Keypair]) -> Self {
         let id = self.id();
-        self.base.sign_all(ctx::KEYSTONE_TX, &id, keys);
+        self.base.sign_all(ctx::KERCKHOFFS_TX, &id, keys);
         self
     }
 }
@@ -260,21 +260,21 @@ impl BlockHeader {
 
 #[derive(Clone, Debug)]
 pub enum Body {
-    Prism(Vec<PrismTx>),
-    Keystone(Vec<KeystoneTx>),
+    Atbash(Vec<AtbashTx>),
+    Kerckhoffs(Vec<KerckhoffsTx>),
 }
 
 impl Body {
     pub fn tx_ids(&self) -> Vec<Hash> {
         match self {
-            Body::Prism(t) => t.iter().map(PrismTx::id).collect(),
-            Body::Keystone(t) => t.iter().map(KeystoneTx::id).collect(),
+            Body::Atbash(t) => t.iter().map(AtbashTx::id).collect(),
+            Body::Kerckhoffs(t) => t.iter().map(KerckhoffsTx::id).collect(),
         }
     }
     pub fn len(&self) -> usize {
         match self {
-            Body::Prism(t) => t.len(),
-            Body::Keystone(t) => t.len(),
+            Body::Atbash(t) => t.len(),
+            Body::Kerckhoffs(t) => t.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -330,8 +330,8 @@ pub struct Delegation {
 /// full node) holds its own copy and re-executes every block.
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
-    pub prism_utxos: BTreeMap<OutPoint, TxOut>,
-    pub keystone_utxos: BTreeMap<OutPoint, TxOut>,
+    pub atbash_utxos: BTreeMap<OutPoint, TxOut>,
+    pub kerckhoffs_utxos: BTreeMap<OutPoint, TxOut>,
     /// (destination chain, outpoint) -> output waiting to be imported.
     pub atomic: BTreeMap<(ChainId, OutPoint), TxOut>,
     pub validators: BTreeMap<Address, Validator>,
@@ -351,7 +351,7 @@ impl Ledger {
         let mut l = Ledger::default();
         let gid = Enc::new("pqchain/genesis/v0").hash();
         for (i, (owner, amount)) in x_allocs.iter().enumerate() {
-            l.prism_utxos.insert(OutPoint { txid: gid, index: i as u32 }, TxOut::native(*owner, *amount));
+            l.atbash_utxos.insert(OutPoint { txid: gid, index: i as u32 }, TxOut::native(*owner, *amount));
         }
         for gv in validators {
             let node_id = gv.signing_key.address();
@@ -367,7 +367,7 @@ impl Ledger {
                 },
             );
         }
-        for c in [ChainId::Keystone, ChainId::Prism] {
+        for c in [ChainId::Kerckhoffs, ChainId::Atbash] {
             l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u8(c.tag()).hash()));
         }
         l
@@ -409,14 +409,14 @@ impl Ledger {
 
     fn utxos(&self, chain: ChainId) -> &BTreeMap<OutPoint, TxOut> {
         match chain {
-            ChainId::Keystone => &self.keystone_utxos,
-            ChainId::Prism => &self.prism_utxos,
+            ChainId::Kerckhoffs => &self.kerckhoffs_utxos,
+            ChainId::Atbash => &self.atbash_utxos,
         }
     }
     fn utxos_mut(&mut self, chain: ChainId) -> &mut BTreeMap<OutPoint, TxOut> {
         match chain {
-            ChainId::Keystone => &mut self.keystone_utxos,
-            ChainId::Prism => &mut self.prism_utxos,
+            ChainId::Kerckhoffs => &mut self.kerckhoffs_utxos,
+            ChainId::Atbash => &mut self.atbash_utxos,
         }
     }
 
@@ -491,13 +491,13 @@ impl Ledger {
         Ok(totals)
     }
 
-    pub fn apply_prism(&mut self, tx: &PrismTx) -> Result<(), String> {
+    pub fn apply_atbash(&mut self, tx: &AtbashTx) -> Result<(), String> {
         let id = tx.id();
         if tx.base.inputs.is_empty() {
             return Err("transaction has no inputs".into());
         }
-        let ins = self.spend_inputs(ChainId::Prism, &tx.base, &id, ctx::PRISM_TX)?;
-        let outs = self.create_outputs(ChainId::Prism, &tx.base, &id)?;
+        let ins = self.spend_inputs(ChainId::Atbash, &tx.base, &id, ctx::ATBASH_TX)?;
+        let outs = self.create_outputs(ChainId::Atbash, &tx.base, &id)?;
         let new_asset = tx.new_asset_id();
         let get = |m: &BTreeMap<AssetId, u128>, a: &AssetId| m.get(a).copied().unwrap_or(0);
 
@@ -519,19 +519,19 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn apply_keystone(&mut self, tx: &KeystoneTx) -> Result<(), String> {
+    pub fn apply_kerckhoffs(&mut self, tx: &KerckhoffsTx) -> Result<(), String> {
         let id = tx.id();
-        let ins = self.spend_inputs(ChainId::Keystone, &tx.base, &id, ctx::KEYSTONE_TX)?;
-        let outs = self.create_outputs(ChainId::Keystone, &tx.base, &id)?;
+        let ins = self.spend_inputs(ChainId::Kerckhoffs, &tx.base, &id, ctx::KERCKHOFFS_TX)?;
+        let outs = self.create_outputs(ChainId::Kerckhoffs, &tx.base, &id)?;
         if ins.keys().chain(outs.keys()).any(|a| *a != NATIVE) {
-            return Err("only the native token lives on the Keystone Chain".into());
+            return Err("only the native token lives on the Kerckhoffs Chain".into());
         }
         let n_in = ins.get(&NATIVE).copied().unwrap_or(0);
         let n_out = outs.get(&NATIVE).copied().unwrap_or(0);
         let (stake, fee) = match &tx.kind {
-            KeystoneKind::Slash { .. } => (0, 0), // reporting misbehaviour is free
-            KeystoneKind::AddValidator { stake, .. } | KeystoneKind::AddDelegator { stake, .. } => (*stake, TX_FEE),
-            KeystoneKind::Transfer => (0, TX_FEE),
+            KerckhoffsKind::Slash { .. } => (0, 0), // reporting misbehaviour is free
+            KerckhoffsKind::AddValidator { stake, .. } | KerckhoffsKind::AddDelegator { stake, .. } => (*stake, TX_FEE),
+            KerckhoffsKind::Transfer => (0, TX_FEE),
         };
         if n_in < n_out + stake as u128 + fee as u128 {
             return Err("inputs do not cover outputs + stake + fee".into());
@@ -539,8 +539,8 @@ impl Ledger {
         self.burned += (n_in - n_out - stake as u128) as u64;
 
         match &tx.kind {
-            KeystoneKind::Transfer => {}
-            KeystoneKind::AddValidator { signing_key, withdrawal, stake } => {
+            KerckhoffsKind::Transfer => {}
+            KerckhoffsKind::AddValidator { signing_key, withdrawal, stake } => {
                 if *stake < MIN_VALIDATOR_STAKE {
                     return Err(format!("validator stake below minimum {MIN_VALIDATOR_STAKE}"));
                 }
@@ -560,7 +560,7 @@ impl Ledger {
                     },
                 );
             }
-            KeystoneKind::AddDelegator { node, stake, reward } => {
+            KerckhoffsKind::AddDelegator { node, stake, reward } => {
                 if *stake < MIN_DELEGATION {
                     return Err(format!("delegation below minimum {MIN_DELEGATION}"));
                 }
@@ -574,7 +574,7 @@ impl Ledger {
                 v.delegated += stake;
                 self.delegations.push(Delegation { node: *node, stake: *stake, reward: *reward });
             }
-            KeystoneKind::Slash { a, b } => {
+            KerckhoffsKind::Slash { a, b } => {
                 let node = self.check_equivocation(a, b)?;
                 let v = self.validators.get_mut(&node).unwrap();
                 v.slashed = true;
@@ -585,7 +585,7 @@ impl Ledger {
                     self.delegations.drain(..).partition(|d| d.node == node);
                 self.delegations = keep;
                 for d in refund {
-                    self.keystone_utxos.insert(OutPoint { txid: id, index: idx }, TxOut::native(d.reward, d.stake));
+                    self.kerckhoffs_utxos.insert(OutPoint { txid: id, index: idx }, TxOut::native(d.reward, d.stake));
                     idx += 1;
                 }
                 v.delegated = 0;
@@ -645,14 +645,14 @@ impl Ledger {
             return Err("tx root mismatch".into());
         }
         match (&b.body, h.chain) {
-            (Body::Prism(txs), ChainId::Prism) => {
+            (Body::Atbash(txs), ChainId::Atbash) => {
                 for (i, t) in txs.iter().enumerate() {
-                    self.apply_prism(t).map_err(|e| format!("tx {i}: {e}"))?;
+                    self.apply_atbash(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
-            (Body::Keystone(txs), ChainId::Keystone) => {
+            (Body::Kerckhoffs(txs), ChainId::Kerckhoffs) => {
                 for (i, t) in txs.iter().enumerate() {
-                    self.apply_keystone(t).map_err(|e| format!("tx {i}: {e}"))?;
+                    self.apply_kerckhoffs(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
             _ => return Err("body does not match chain".into()),
@@ -664,7 +664,7 @@ impl Ledger {
     /// Commitment to the entire state; replicas must agree on this.
     pub fn state_root(&self) -> Hash {
         let mut e = Enc::new("pqchain/state");
-        for (c, m) in [(0u8, &self.prism_utxos), (1, &self.keystone_utxos)] {
+        for (c, m) in [(0u8, &self.atbash_utxos), (1, &self.kerckhoffs_utxos)] {
             e.u8(c).u64(m.len() as u64);
             for (p, o) in m {
                 e.bytes(&p.txid).u64(p.index as u64);
@@ -690,8 +690,8 @@ impl Ledger {
 /// Build and sign a block as the given proposer.
 pub fn propose(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64) -> Block {
     let chain = match body {
-        Body::Prism(_) => ChainId::Prism,
-        Body::Keystone(_) => ChainId::Keystone,
+        Body::Atbash(_) => ChainId::Atbash,
+        Body::Kerckhoffs(_) => ChainId::Kerckhoffs,
     };
     let (h, parent) = ledger.tip(chain);
     let header = BlockHeader {

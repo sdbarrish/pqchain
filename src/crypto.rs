@@ -24,8 +24,8 @@ pub const SIG_LEN: usize = 3309;
 /// Domain-separation contexts (FIPS 204 `ctx` parameter). A signature made
 /// for one purpose can never be replayed as another.
 pub mod ctx {
-    pub const PRISM_TX: &[u8] = b"pqchain/v0/prism/tx";
-    pub const KEYSTONE_TX: &[u8] = b"pqchain/v0/keystone/tx";
+    pub const ATBASH_TX: &[u8] = b"pqchain/v0/atbash/tx";
+    pub const KERCKHOFFS_TX: &[u8] = b"pqchain/v0/kerckhoffs/tx";
     pub const BLOCK: &[u8] = b"pqchain/v0/block";
     pub const VOTE: &[u8] = b"pqchain/v0/finality-vote";
 }

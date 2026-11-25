@@ -27,6 +27,11 @@ pub const UNBONDING_BLOCKS: u64 = 10;
 /// Fee (burned) for registering a zone.
 pub const ZONE_FEE: u64 = 100;
 pub const MAX_ZONE_MEMBERS: usize = 64;
+/// New native tokens issued per accepted block (any chain), shared by that
+/// chain's validators in proportion to stake (own + delegated).
+pub const BLOCK_REWARD: u64 = 1_000;
+/// Commission a validator keeps from its delegators' share (basis points).
+pub const DELEGATION_FEE_BPS: u64 = 1_000; // 10%
 
 static EMPTY_UTXOS: BTreeMap<OutPoint, TxOut> = BTreeMap::new();
 
@@ -289,6 +294,9 @@ pub enum KerckhoffsKind {
     Exit { node: Address, authority: PublicKey, sig: Signature },
     /// Register a zone validated by the listed primary validators.
     CreateZone { name: String, members: Vec<Address> },
+    /// Pay out accumulated staking rewards to `authority`'s address. `nonce`
+    /// must equal the address's claim count, so a claim cannot be replayed.
+    ClaimRewards { authority: PublicKey, nonce: u64, sig: Signature },
 }
 
 #[derive(Clone, Debug)]
@@ -329,8 +337,24 @@ impl KerckhoffsTx {
                 }
                 &mut e
             }
+            KerckhoffsKind::ClaimRewards { authority, nonce, .. } => {
+                e.u8(6).u8(authority.alg).bytes(&authority.bytes).u64(*nonce)
+            }
         };
         e.hash()
+    }
+
+    /// Build a reward claim signed by the address owner's key.
+    pub fn claim_rewards(key: &Keypair, nonce: u64) -> Self {
+        let mut tx = KerckhoffsTx {
+            base: Transfer::default(),
+            kind: KerckhoffsKind::ClaimRewards { authority: key.public.clone(), nonce, sig: Signature::empty() },
+        };
+        let id = tx.id();
+        if let KerckhoffsKind::ClaimRewards { sig, .. } = &mut tx.kind {
+            *sig = key.sign(ctx::CLAIM, &id);
+        }
+        tx
     }
 
     pub fn sign(mut self, keys: &[&Keypair]) -> Self {
@@ -521,6 +545,12 @@ pub struct Ledger {
     pub zone_utxos: BTreeMap<u32, BTreeMap<OutPoint, TxOut>>,
     /// Relay messages already claimed: (source chain, outpoint).
     pub relay_consumed: BTreeSet<(ChainId, OutPoint)>,
+    /// Unclaimed staking rewards per address.
+    pub rewards: BTreeMap<Address, u64>,
+    /// Number of reward claims made per address (replay protection).
+    pub claim_nonces: BTreeMap<Address, u64>,
+    /// Total native tokens issued as rewards.
+    pub minted: u64,
 }
 
 pub struct GenesisValidator {
@@ -836,6 +866,7 @@ impl Ledger {
             // Reporting misbehaviour is free; an exit is authorized by its signature.
             KerckhoffsKind::Slash { .. } | KerckhoffsKind::Exit { .. } => (0, 0),
             KerckhoffsKind::CreateZone { .. } => (0, ZONE_FEE),
+            KerckhoffsKind::ClaimRewards { .. } => (0, 0),
             KerckhoffsKind::AddValidator { stake, .. } | KerckhoffsKind::AddDelegator { stake, .. } => (*stake, TX_FEE),
             KerckhoffsKind::Transfer => (0, TX_FEE),
         };
@@ -937,8 +968,53 @@ impl Ledger {
                 self.tips.insert(chain, (0, Enc::new("pqchain/genesis-block").u64(chain.code()).hash()));
                 self.anchors.insert(chain, created_at);
             }
+            KerckhoffsKind::ClaimRewards { authority, nonce, sig } => {
+                let owner = authority.address();
+                if *nonce != self.claim_nonces.get(&owner).copied().unwrap_or(0) {
+                    return Err("stale or future claim nonce".into());
+                }
+                if !authority.verify(ctx::CLAIM, &id, sig) {
+                    return Err("invalid claim signature".into());
+                }
+                let amount = self.rewards.remove(&owner).filter(|a| *a > 0).ok_or("no rewards to claim")?;
+                *self.claim_nonces.entry(owner).or_default() += 1;
+                let op = OutPoint { txid: id, index: tx.base.n_outpoints() };
+                self.kerckhoffs_utxos.insert(op, TxOut::native(owner, amount));
+            }
         }
         Ok(())
+    }
+
+    /// Issue `BLOCK_REWARD` for a block on `chain`, split across the chain's
+    /// validators (as of `anchor`) by weight. Each validator's share is split
+    /// between its own stake (paid to its withdrawal address) and its
+    /// delegators, minus the validator's commission. Rounding dust is not issued.
+    fn distribute_rewards(&mut self, chain: ChainId, anchor: u64) {
+        let Some(set) = self.chain_validators(chain, anchor) else { return };
+        let total: u128 = set.values().map(|v| v.weight() as u128).sum();
+        if total == 0 {
+            return;
+        }
+        let mut credits: Vec<(Address, u64)> = Vec::new();
+        for v in set.values().filter(|v| v.weight() > 0) {
+            let share = BLOCK_REWARD as u128 * v.weight() as u128 / total;
+            let own = share * v.stake as u128 / v.weight() as u128;
+            let to_delegators = share - own;
+            let fee = to_delegators * DELEGATION_FEE_BPS as u128 / 10_000;
+            let pool = to_delegators - fee;
+            let ds: Vec<&Delegation> = self.delegations.iter().filter(|d| d.node == v.node_id).collect();
+            let dsum: u128 = ds.iter().map(|d| d.stake as u128).sum();
+            credits.push((v.withdrawal, (own + fee) as u64));
+            for d in ds {
+                if dsum > 0 {
+                    credits.push((d.reward, (pool * d.stake as u128 / dsum) as u64));
+                }
+            }
+        }
+        for (a, amt) in credits.into_iter().filter(|(_, a)| *a > 0) {
+            *self.rewards.entry(a).or_default() += amt;
+            self.minted += amt;
+        }
     }
 
     /// Release stake of validators whose unbonding period ended at `height`.
@@ -1054,6 +1130,7 @@ impl Ledger {
             }
             _ => return Err("body does not match chain".into()),
         }
+        self.distribute_rewards(h.chain, h.anchor);
         self.tips.insert(h.chain, (h.height, h.hash()));
         self.anchors.insert(h.chain, h.anchor);
         if h.chain == ChainId::Kerckhoffs {
@@ -1101,7 +1178,13 @@ impl Ledger {
         for (c, (h, hash)) in &self.tips {
             e.u64(c.code()).u64(*h).bytes(hash).u64(self.anchors.get(c).copied().unwrap_or(0));
         }
-        e.u64(self.burned);
+        e.u64(self.burned).u64(self.minted);
+        for (a, r) in &self.rewards {
+            e.bytes(&a.0).u64(*r);
+        }
+        for (a, n) in &self.claim_nonces {
+            e.bytes(&a.0).u64(*n);
+        }
         e.hash()
     }
 }

@@ -964,6 +964,7 @@ impl Engine {
             "state_root": hex::encode(self.ledger.state_root()),
             "total_stake": self.ledger.total_weight(),
             "burned": self.ledger.burned,
+            "minted": self.ledger.minted,
         })
     }
 

@@ -141,6 +141,12 @@ enum WalletCmd {
         #[arg(long)]
         chain: String,
     },
+    /// Claim staking rewards earned by this key's address (validator withdrawal
+    /// address or delegator reward address); paid on the Kerckhoffs Chain.
+    ClaimRewards {
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Start a validator's exit (signed by its cold withdrawal key).
     Exit {
         /// Withdrawal key file of the validator.
@@ -267,6 +273,12 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
             let k = node::load_key(&key)?;
             let (tx, amount) = wallet::relay_import(&c, &k, chain_from_str(&chain)?)?;
             println!("claiming {amount} (proofs verified by the receiving chain)");
+            submit(&c, tx)?;
+        }
+        WalletCmd::ClaimRewards { key } => {
+            let k = node::load_key(&key)?;
+            let (tx, amount) = wallet::claim_rewards(&c, &k)?;
+            println!("claiming {amount} in staking rewards");
             submit(&c, tx)?;
         }
         WalletCmd::Exit { withdrawal_key, node } => {

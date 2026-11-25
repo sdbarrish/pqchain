@@ -45,6 +45,7 @@ pub mod ctx {
     pub const BLOCK: &[u8] = b"pqchain/v0/block";
     pub const VOTE: &[u8] = b"pqchain/v0/finality-vote";
     pub const EXIT: &[u8] = b"pqchain/v2/validator-exit";
+    pub const CLAIM: &[u8] = b"pqchain/v3/claim-rewards";
 }
 
 /// Canonical, length-prefixed encoder used for every hash in the protocol.

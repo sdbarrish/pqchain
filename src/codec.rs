@@ -399,6 +399,12 @@ impl Wire for KerckhoffsTx {
                 w.bytes(name.as_bytes());
                 w.list(members);
             }
+            KerckhoffsKind::ClaimRewards { authority, nonce, sig } => {
+                w.u8(6);
+                authority.put(w);
+                w.u64(*nonce);
+                sig.put(w);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
@@ -431,6 +437,11 @@ impl Wire for KerckhoffsTx {
                 }
                 KerckhoffsKind::CreateZone { name, members: r.list()? }
             }
+            6 => KerckhoffsKind::ClaimRewards {
+                authority: PublicKey::get(r)?,
+                nonce: r.u64()?,
+                sig: Signature::get(r)?,
+            },
             _ => return Err("unknown Kerckhoffs tx kind".into()),
         };
         Ok(KerckhoffsTx { base, kind })

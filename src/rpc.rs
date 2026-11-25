@@ -8,6 +8,7 @@
 //! GET  /block/{chain}/{height}      block summary + certificate size
 //! GET  /inbox/{chain}/{address}     relay messages to claim, with proofs
 //! GET  /zones                       registered zones
+//! GET  /rewards/{address}           unclaimed staking rewards and claim nonce
 //! POST /tx                          hex-encoded signed transaction
 
 use crate::codec::{Tx, Wire};
@@ -110,6 +111,16 @@ async fn inbox(State(e): State<Shared>, Path((chain, addr)): Path<(String, Strin
     Ok(Json(json!(items)))
 }
 
+async fn rewards(State(e): State<Shared>, Path(addr): Path<String>) -> Reply {
+    let a = Address::from_text(&addr).map_err(bad)?;
+    let e = e.lock().unwrap();
+    Ok(Json(json!({
+        "address": a.to_text(),
+        "unclaimed": e.ledger.rewards.get(&a).copied().unwrap_or(0),
+        "nonce": e.ledger.claim_nonces.get(&a).copied().unwrap_or(0),
+    })))
+}
+
 async fn zones(State(e): State<Shared>) -> Json<Value> {
     Json(e.lock().unwrap().status_json()["zones"].clone())
 }
@@ -132,6 +143,7 @@ pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
         .route("/block/{chain}/{height}", get(block))
         .route("/inbox/{chain}/{addr}", get(inbox))
         .route("/zones", get(zones))
+        .route("/rewards/{addr}", get(rewards))
         .route("/tx", post(submit))
         .with_state(engine);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("rpc {addr}: {e}"))?;

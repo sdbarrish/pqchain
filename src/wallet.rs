@@ -74,6 +74,17 @@ fn wrap(chain: ChainId, base: Transfer, kind: KerckhoffsKind, n: usize, key: &Ke
     }
 }
 
+/// Claim accumulated staking rewards for this key's address.
+pub fn claim_rewards(c: &Client, key: &Keypair) -> Result<(Tx, u64), String> {
+    let v = c.get(&format!("/rewards/{}", key.address().to_text()))?;
+    let amount = v["unclaimed"].as_u64().unwrap_or(0);
+    if amount == 0 {
+        return Err("no rewards to claim".into());
+    }
+    let nonce = v["nonce"].as_u64().ok_or("unexpected RPC reply")?;
+    Ok((Tx::Kerckhoffs(KerckhoffsTx::claim_rewards(key, nonce)), amount))
+}
+
 /// Register a zone validated by `members` (primary validator node ids).
 pub fn create_zone(c: &Client, key: &Keypair, name: &str, members: Vec<Address>) -> Result<Tx, String> {
     let pool = native_only(c.utxos(ChainId::Kerckhoffs, &key.address())?);

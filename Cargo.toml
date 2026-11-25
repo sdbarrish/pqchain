@@ -1,0 +1,10 @@
+[package]
+name = "pqchain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hex = "0.4.3"
+libcrux-ml-dsa = "0.0.12"
+rand = "0.10"
+sha3 = "0.12"

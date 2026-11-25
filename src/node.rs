@@ -28,6 +28,10 @@ pub const MAX_BLOCK_TXS: usize = 1_000;
 pub const MAX_MEMPOOL: usize = 10_000;
 pub const MAX_ORPHANS: usize = 256;
 pub const SYNC_BATCH: u64 = 32;
+/// Stop dialing newly discovered peers beyond this many connections.
+pub const MAX_PEERS: usize = 32;
+const MAX_KNOWN_PEERS: usize = 1_000;
+const DISCOVERY_EVERY: Duration = Duration::from_secs(2);
 
 /// Testnet consensus parameters. alpha=12 of k=20 keeps the network live
 /// when a validator is offline; mainnet would use a higher alpha.
@@ -176,7 +180,11 @@ pub struct NodeConfig {
     pub data_dir: String,
     pub listen: String,
     pub rpc: String,
+    /// Bootstrap peers; more are discovered from them.
     pub peers: Vec<String>,
+    /// Address other nodes should dial (defaults to `listen`).
+    #[serde(default)]
+    pub advertise: Option<String>,
 }
 
 // ───────────────────────────── storage ─────────────────────────────
@@ -254,6 +262,33 @@ pub enum Msg {
     GetBlocks { chain: ChainId, from: u64 },
     Blocks(Vec<(Block, FinalityCert)>),
     WantBlock { chain: ChainId, height: u64, hash: Hash },
+    /// Sent on connect: the address the sender accepts connections on.
+    Hello { listen: String },
+    /// Peers the sender knows: (node id, dialable address).
+    Peers(Vec<(Address, String)>),
+}
+
+impl Wire for String {
+    fn put(&self, w: &mut Writer) {
+        w.bytes(self.as_bytes());
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        let b = r.bytes()?;
+        if b.len() > 256 {
+            return Err("string too long".into());
+        }
+        String::from_utf8(b).map_err(|_| "string not UTF-8".into())
+    }
+}
+
+impl Wire for (Address, String) {
+    fn put(&self, w: &mut Writer) {
+        self.0.put(w);
+        self.1.put(w);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok((Address::get(r)?, String::get(r)?))
+    }
 }
 
 impl Wire for (ChainId, u64) {
@@ -331,6 +366,14 @@ impl Wire for Msg {
                 w.u64(*height);
                 w.fixed(hash);
             }
+            Msg::Hello { listen } => {
+                w.u8(9);
+                listen.put(w);
+            }
+            Msg::Peers(v) => {
+                w.u8(10);
+                w.list(v);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
@@ -358,6 +401,8 @@ impl Wire for Msg {
             6 => Msg::GetBlocks { chain: ChainId::get(r)?, from: r.u64()? },
             7 => Msg::Blocks(r.list()?),
             8 => Msg::WantBlock { chain: ChainId::get(r)?, height: r.u64()?, hash: r.hash()? },
+            9 => Msg::Hello { listen: String::get(r)? },
+            10 => Msg::Peers(r.list()?),
             _ => return Err("unknown message type".into()),
         })
     }
@@ -400,6 +445,10 @@ pub struct Engine {
     wait_since: BTreeMap<ChainId, Instant>,
     proposed: BTreeSet<(ChainId, u64, u32)>,
     pub peers: BTreeMap<Address, PeerTx>,
+    /// Address this node advertises for inbound connections.
+    pub listen: String,
+    /// Discovered peers: node id -> dialable address.
+    pub known: BTreeMap<Address, String>,
     last_status: Instant,
     last_sync_req: BTreeMap<ChainId, Instant>,
     params: Params,
@@ -426,6 +475,8 @@ impl Engine {
             wait_since: BTreeMap::new(),
             proposed: BTreeSet::new(),
             peers: BTreeMap::new(),
+            listen: String::new(),
+            known: BTreeMap::new(),
             last_status: now,
             last_sync_req: BTreeMap::new(),
             params: testnet_params(),
@@ -488,7 +539,34 @@ impl Engine {
 
     pub fn on_connect(&mut self, peer: Address) {
         self.log(format!("connected to {peer} (ML-KEM-768 + X25519, ML-DSA-65 authenticated)"));
+        if !self.listen.is_empty() {
+            self.send(&peer, &Msg::Hello { listen: self.listen.clone() });
+        }
+        self.send(&peer, &self.peers_msg());
         self.send(&peer, &self.status_msg());
+    }
+
+    fn peers_msg(&self) -> Msg {
+        Msg::Peers(self.known.iter().take(64).map(|(a, l)| (*a, l.clone())).collect())
+    }
+
+    fn learn_peer(&mut self, id: Address, addr: String) -> bool {
+        let valid = addr.parse::<std::net::SocketAddr>().is_ok_and(|s| s.port() != 0);
+        if id == self.me || !valid || (self.known.len() >= MAX_KNOWN_PEERS && !self.known.contains_key(&id)) {
+            return false;
+        }
+        self.known.insert(id, addr.clone()) != Some(addr)
+    }
+
+    /// Known peers worth dialing: not connected, not ourselves, within MAX_PEERS.
+    pub fn dial_candidates(&self) -> Vec<(Address, String)> {
+        let room = MAX_PEERS.saturating_sub(self.peers.len());
+        self.known
+            .iter()
+            .filter(|(a, _)| !self.peers.contains_key(*a) && **a != self.me)
+            .take(room)
+            .map(|(a, l)| (*a, l.clone()))
+            .collect()
     }
 
     fn status_msg(&self) -> Msg {
@@ -898,6 +976,18 @@ impl Engine {
             Msg::Vote { chain, height, hash, voter, sig } => self.on_vote(from, chain, height, hash, voter, sig),
             Msg::GetBlocks { chain, from: start } => self.on_get_blocks(from, chain, start),
             Msg::Blocks(list) => self.on_blocks(list),
+            Msg::Hello { listen } => {
+                if self.learn_peer(from, listen) {
+                    // Tell everyone else about the newcomer.
+                    let m = Msg::Peers(vec![(from, self.known[&from].clone())]);
+                    self.broadcast(&m, Some(from));
+                }
+            }
+            Msg::Peers(list) => {
+                for (id, addr) in list.into_iter().take(64) {
+                    self.learn_peer(id, addr);
+                }
+            }
             Msg::WantBlock { chain, height, hash } => {
                 let b = self
                     .cands
@@ -1083,6 +1173,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         records,
     )?));
     let key = Arc::new(load_key(&key_path)?);
+    engine.lock().unwrap().listen = cfg.advertise.clone().unwrap_or_else(|| cfg.listen.clone());
     println!(
         "[{}] node {} starting · network {} · p2p {} · rpc {}",
         cfg.name,
@@ -1126,6 +1217,34 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    // Peer discovery: dial peers learned from others, pinning their identity.
+    {
+        let (engine, key) = (engine.clone(), key.clone());
+        tokio::spawn(async move {
+            let dialing: Arc<Mutex<BTreeSet<Address>>> = Arc::default();
+            loop {
+                tokio::time::sleep(DISCOVERY_EVERY).await;
+                let candidates = engine.lock().unwrap().dial_candidates();
+                for (id, addr) in candidates {
+                    if !dialing.lock().unwrap().insert(id) {
+                        continue;
+                    }
+                    let (engine, key, dialing) = (engine.clone(), key.clone(), dialing.clone());
+                    tokio::spawn(async move {
+                        if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await {
+                            let _ = s.set_nodelay(true);
+                            let hs = transport::connect(s, &key, &network_id, Some(id));
+                            if let Ok(Ok(sess)) = tokio::time::timeout(Duration::from_secs(10), hs).await {
+                                run_session(engine, sess).await;
+                            }
+                        }
+                        dialing.lock().unwrap().remove(&id);
+                    });
+                }
             }
         });
     }

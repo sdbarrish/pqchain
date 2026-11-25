@@ -80,13 +80,16 @@ ALL=(8100 8101 8102 8103 8104)
 
 say "Start nodes"
 for n in validator-0 validator-1 validator-2 validator-3 full-0; do start_node "$n"; done
-sleep 2
 for p in "${ALL[@]}"; do
-  peers=$(rpc "$p" /status | jget "len(d['peers'])" 2>/dev/null || echo 0)
-  [ "$peers" -ge 4 ] || { sleep 2; peers=$(rpc "$p" /status | jget "len(d['peers'])"); }
+  for _ in $(seq 1 60); do
+    peers=$(rpc "$p" /status | jget "len(d['peers'])" 2>/dev/null || echo 0)
+    [ "$peers" -ge 4 ] && break
+    sleep 0.5
+  done
   [ "$peers" -ge 4 ] || fail "node on $p has only $peers peers"
 done
-ok "all 5 nodes connected (hybrid post-quantum handshake)"
+ok "every node was configured with one bootstrap peer; discovery built the full mesh"
+ok "all links use the hybrid post-quantum handshake"
 
 say "Payments on the Atbash Chain"
 wallet new --out "$WORK/alice.key" >/dev/null
@@ -118,7 +121,7 @@ mkdir -p "$WORK/validator-4"
 cat >"$WORK/validator-4/config.json" <<EOF
 { "name": "validator-4", "key": "node.key", "genesis": "../genesis.json", "data_dir": "data",
   "listen": "127.0.0.1:$((P2P + 5))", "rpc": "127.0.0.1:$((RPC + 5))",
-  "peers": ["127.0.0.1:$P2P", "127.0.0.1:$((P2P + 1))", "127.0.0.1:$((P2P + 2))", "127.0.0.1:$((P2P + 3))", "127.0.0.1:$((P2P + 4))"] }
+  "peers": ["127.0.0.1:$((P2P + 4))"] }
 EOF
 wallet stake --key "$WORK/alice.key" --node-key "$WORK/validator-4/node.key" --amount 5000 | sed 's/^/  /'
 wait_all kerckhoffs 2 "${ALL[@]}"
@@ -126,7 +129,10 @@ start_node validator-4
 ALL+=(8105)
 wait_all kerckhoffs 2 8105
 wait_all atbash 4 8105
-ok "validator-4 registered (stake 5000), started, and synced from certified blocks"
+for _ in $(seq 1 60); do
+  [ "$(rpc 8105 /status | jget "len(d['peers'])")" -ge 5 ] && break; sleep 0.5
+done
+ok "validator-4 registered (stake 5000), bootstrapped from the full node only, discovered $(rpc 8105 /status | jget "len(d['peers'])") peers, synced from certified blocks"
 
 V4=$(wallet show --key "$WORK/validator-4/node.key")
 wallet export --key "$WORK/faucet.key" --amount 3000 --from atbash --to kerckhoffs | sed 's/^/  /'

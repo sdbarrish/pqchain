@@ -212,8 +212,8 @@ fn testnet_init(
                 stake,
             });
         }
-        // Validator i dials validators 0..i; full nodes dial every validator.
-        let dial = if i < validators { i } else { validators };
+        // Every node bootstraps from validator-0 only; peer discovery finds the rest.
+        let dial = usize::from(i > 0);
         let cfg = NodeConfig {
             name: name.clone(),
             key: "node.key".into(),
@@ -222,6 +222,7 @@ fn testnet_init(
             listen: format!("127.0.0.1:{}", p2p as usize + i),
             rpc: format!("127.0.0.1:{}", rpc as usize + i),
             peers: (0..dial).map(|j| format!("127.0.0.1:{}", p2p as usize + j)).collect(),
+            advertise: None,
         };
         write_json(&nd.join("config.json"), &cfg)?;
     }

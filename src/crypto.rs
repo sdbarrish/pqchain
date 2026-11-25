@@ -98,6 +98,18 @@ impl fmt::Display for Address {
         write!(f, "pq1{}", hex::encode(&self.0[..8]))
     }
 }
+impl Address {
+    /// Full textual form: "pq1" + 64 hex characters.
+    pub fn to_text(&self) -> String {
+        format!("pq1{}", hex::encode(self.0))
+    }
+    pub fn from_text(s: &str) -> Result<Self, String> {
+        let h = s.strip_prefix("pq1").ok_or("address must start with pq1")?;
+        let b = hex::decode(h).map_err(|e| e.to_string())?;
+        Ok(Address(b.try_into().map_err(|_| "address must be 32 bytes")?))
+    }
+}
+
 impl fmt::Debug for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -153,19 +165,30 @@ impl PublicKey {
 pub struct Keypair {
     kp: MLDSA65KeyPair,
     pub public: PublicKey,
+    seed: [u8; 32],
 }
 
 impl Keypair {
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
         rand::fill(&mut seed);
+        Self::from_seed(seed)
+    }
+
+    /// Deterministic key pair from a 32-byte seed (the seed is the secret
+    /// that key files store).
+    pub fn from_seed(seed: [u8; 32]) -> Self {
         let kp = ml_dsa_65::generate_key_pair(seed);
-        seed.fill(0);
         let public = PublicKey {
             alg: ALG_ML_DSA_65,
             bytes: kp.verification_key.as_slice().to_vec(),
         };
-        Keypair { kp, public }
+        Keypair { kp, public, seed }
+    }
+
+    /// The secret seed. Handle with care.
+    pub fn seed(&self) -> [u8; 32] {
+        self.seed
     }
 
     pub fn address(&self) -> Address {

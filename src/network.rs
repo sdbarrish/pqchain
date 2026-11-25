@@ -54,7 +54,7 @@ impl Network {
     pub fn next_proposer(&self, chain: ChainId) -> &Node {
         let l = self.ledger();
         let (h, parent) = l.tip(chain);
-        let a = l.scheduled_proposer(chain, h + 1, &parent).expect("no validators");
+        let a = l.scheduled_proposer(chain, h + 1, &parent, 0, l.current_anchor()).expect("no validators");
         self.node_by_addr(&a).expect("proposer node not running")
     }
 
@@ -143,6 +143,11 @@ pub fn select_native(
         Source::Local => l.utxos_of(chain, owner),
         Source::Atomic => l.atomic_of(chain, owner),
     };
+    select_from_pool(pool, need)
+}
+
+/// Coin selection over an explicit list of outputs (used by remote wallets).
+pub fn select_from_pool(pool: Vec<(OutPoint, TxOut)>, need: u64) -> Result<(Vec<OutPoint>, u64), String> {
     let mut picked = Vec::new();
     let mut total = 0;
     for (p, o) in pool.into_iter().filter(|(_, o)| o.asset == NATIVE) {
@@ -169,9 +174,25 @@ pub fn native_transfer(
     export: Option<(ChainId, Vec<TxOut>)>,
     locked: u64,
 ) -> Result<(Transfer, usize), String> {
+    let pool = match source {
+        Source::Local => l.utxos_of(chain, &from.address()),
+        Source::Atomic => l.atomic_of(chain, &from.address()),
+    };
+    native_transfer_from_pool(pool, source, from, outputs, export, locked)
+}
+
+/// Like [`native_transfer`] but from an explicit UTXO list (remote wallets).
+pub fn native_transfer_from_pool(
+    pool: Vec<(OutPoint, TxOut)>,
+    source: Source,
+    from: &Keypair,
+    outputs: Vec<TxOut>,
+    export: Option<(ChainId, Vec<TxOut>)>,
+    locked: u64,
+) -> Result<(Transfer, usize), String> {
     let sent: u64 = outputs.iter().chain(export.iter().flat_map(|(_, e)| e)).map(|o| o.amount).sum();
     let need = sent + locked + TX_FEE;
-    let (ins, total) = select_native(l, chain, source, &from.address(), need)?;
+    let (ins, total) = select_from_pool(pool, need)?;
     let spends: Vec<_> = ins.iter().map(|p| (*p, source, from)).collect();
     let mut outs = outputs;
     if total > need {

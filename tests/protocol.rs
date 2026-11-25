@@ -17,7 +17,7 @@ fn setup() -> (Vec<Keypair>, Keypair, Keypair, Ledger) {
 
 fn proposer<'a>(vals: &'a [Keypair], l: &Ledger, c: ChainId) -> &'a Keypair {
     let (h, p) = l.tip(c);
-    let s = l.scheduled_proposer(c, h + 1, &p).unwrap();
+    let s = l.scheduled_proposer(c, h + 1, &p, 0, l.current_anchor()).unwrap();
     vals.iter().find(|k| k.address() == s).unwrap()
 }
 

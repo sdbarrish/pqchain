@@ -1,4 +1,4 @@
-# PQ-Chain testnet v0
+# PQ-Chain testnet
 
 A post-quantum, multi-chain blockchain prototype in Rust.
 
@@ -31,22 +31,63 @@ Each chain is named after a piece of cryptographic history:
 ## Run
 
 ```bash
-cargo run --release     # end-to-end demo: payments, double-spend attack, slashing, staking, 8 attack checks
-cargo test --release    # protocol tests
+cargo build --release
+./target/release/pqchain demo            # v0 in-process demo (simulated network, attack checks)
+scripts/local-testnet.sh                 # v1: real multi-process testnet, full end-to-end scenario
+cargo test --release                     # protocol, codec and transport tests
 ```
+
+### Run a local testnet by hand
+
+```bash
+pqchain testnet-init --dir testnet                       # keys, genesis, configs (4 validators + 1 full node)
+pqchain node --config testnet/validator-0/config.json    # start each node (one terminal each, or in background)
+
+pqchain wallet new --out alice.key
+pqchain wallet send --key testnet/faucet.key --to <alice address> --amount 100000
+pqchain wallet balance --key alice.key
+pqchain wallet export --key alice.key --amount 20000 --from atbash --to kerckhoffs
+pqchain wallet import --key alice.key --chain kerckhoffs
+pqchain wallet stake --key alice.key --node-key <new node>/node.key --amount 5000
+pqchain wallet delegate --key alice.key --node <validator address> --amount 500
+pqchain wallet create-asset --key alice.key --name QUBIT --supply 21000000
+```
+
+Wallets sign locally; only signed transactions are sent to a node (`--rpc http://127.0.0.1:8100`).
+
+## v1 networking
+
+| Piece | Implementation |
+|---|---|
+| Transport | Hybrid **ML-KEM-768 + X25519** key exchange, **ML-DSA-65** mutual authentication over the full transcript, ChaCha20-Poly1305 frames. Fresh ephemeral keys per connection (forward secrecy). Network ID derived from genesis. |
+| Consensus over the network | Validators poll k=20 stake-weighted samples with `Query`/`Chits` messages (testnet alpha=12, beta=15). |
+| Finality certificates | After accepting, validators broadcast signed votes; >2/3 of stake forms a certificate. Full nodes and catching-up nodes accept blocks by certificate. |
+| Proposer fallback | Blocks carry a `round`; if the scheduled proposer is offline, the next round's proposer takes over after 2 s. |
+| Cross-chain determinism | Every block carries an `anchor` (Kerckhoffs height) whose validator set governs it, so nodes agree regardless of the order they accept the two chains. |
+| Storage | Append-only `chain.log` (blocks + certificates, checksummed, fsync'd). Torn writes are truncated; state is rebuilt by replay at startup. |
+| Sync | Nodes exchange tips every second and fetch missing certified blocks in batches. |
+| RPC | JSON over HTTP: `/status`, `/validators`, `/balance`, `/utxos`, `/atomic`, `/block`, `POST /tx`. |
+| Hardening | Bounded decoding (no panics or huge allocations on hostile input), frame size limits, handshake timeouts, `#![forbid(unsafe_code)]`. |
 
 ## Layout
 
 - `src/crypto.rs`: ML-DSA-65 keys, SHA3, Merkle, addresses
 - `src/ledger.rs`: transactions, blocks, Atbash/Kerckhoffs state transition rules
 - `src/consensus.rs`: Sampled Quorum Consensus, finality certificates, light client
-- `src/network.rs`: in-process nodes, finalize flow, wallet helpers
-- `src/main.rs`: demo scenario
-- `tests/protocol.rs`: tests
+- `src/network.rs`: in-process simulation, coin selection helpers
+- `src/codec.rs`: binary wire format
+- `src/transport.rs`: hybrid post-quantum encrypted transport
+- `src/node.rs`: node engine (gossip, voting, certificates, sync, storage)
+- `src/rpc.rs`: HTTP RPC
+- `src/wallet.rs`: wallet transaction builders and RPC client
+- `src/main.rs`, `src/demo.rs`: CLI and v0 demo
+- `scripts/local-testnet.sh`: end-to-end multi-process test
+- `tests/`: protocol, codec and transport tests
 
 ## Roadmap
 
-- **v1**: real P2P (ML-KEM-768 + X25519 hybrid transport), persistent storage (RocksDB), Feistel Chain (EVM with PQ account abstraction), sentry nodes, staking rewards and expiry, RPC
+- **v1 (done, milestone 1)**: real P2P with hybrid post-quantum transport, consensus over the network, finality certificates, persistent storage, sync, RPC, wallet CLI, multi-process testnet
+- **v1 milestone 2**: Feistel Chain (smart contracts with PQ accounts), staking rewards and expiry, sentry nodes, peer discovery, state snapshots (no full replay), Docker images
 - **v2**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
 - **v3**: Hamming Chain (hash-based data availability), Playfair Chain bridges, fuzzing, formal verification (Kani/Verus), external audits
 

@@ -8,7 +8,12 @@
 //! PROTOTYPE: not audited, not for real value.
 #![forbid(unsafe_code)]
 
+pub mod codec;
 pub mod consensus;
 pub mod crypto;
 pub mod ledger;
 pub mod network;
+pub mod node;
+pub mod rpc;
+pub mod transport;
+pub mod wallet;

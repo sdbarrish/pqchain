@@ -1,274 +1,293 @@
-//! Testnet v0 demo: boots a 10-validator network plus a full node and a light
-//! client, then exercises payments, asset creation, a double-spend attack,
-//! slashing, cross-chain staking, delegation, and several forgery attempts.
+//! `pqchain` command-line tool: demo, testnet setup, node daemon, wallet.
 
 #![forbid(unsafe_code)]
 
-use pqchain::consensus::{LightClient, Params};
-use pqchain::crypto::*;
-use pqchain::ledger::*;
-use pqchain::network::*;
-use std::time::Instant;
+mod demo;
 
-fn h(x: &Hash) -> String {
-    hex::encode(&x[..6])
+use clap::{Parser, Subcommand};
+use pqchain::crypto::{Address, Keypair, PublicKey, ALG_ML_DSA_65};
+use pqchain::node::{self, chain_from_str, Allocation, Genesis, GenesisValidatorEntry, NodeConfig};
+use pqchain::wallet::{self, Client};
+use std::path::{Path, PathBuf};
+
+#[derive(Parser)]
+#[command(name = "pqchain", version, about = "Post-quantum multi-chain blockchain (testnet)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-fn report(r: &Report, label: &str) {
-    println!(
-        "  ✔ {} #{} accepted ({label}): {} rounds / {} polls; finality cert {} votes, {:.1} KB, light client verified {}% stake",
-        r.chain.name(),
-        r.height,
-        r.rounds,
-        r.polls,
-        r.cert_votes,
-        r.cert_bytes as f64 / 1024.0,
-        r.light_client_stake_pct
-    );
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the in-process v0 demo (simulated network).
+    Demo,
+    /// Create keys, genesis and configs for a local multi-node testnet.
+    TestnetInit {
+        #[arg(long, default_value = "testnet")]
+        dir: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        validators: usize,
+        #[arg(long, default_value_t = 1)]
+        full_nodes: usize,
+        #[arg(long, default_value_t = 9100)]
+        p2p_port: u16,
+        #[arg(long, default_value_t = 8100)]
+        rpc_port: u16,
+        #[arg(long, default_value_t = 2_000)]
+        stake: u64,
+        #[arg(long, default_value_t = 10_000_000)]
+        faucet: u64,
+    },
+    /// Run a node.
+    Node {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Wallet commands (keys stay local; transactions are signed here).
+    Wallet {
+        /// Node RPC endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8100", global = true)]
+        rpc: String,
+        #[command(subcommand)]
+        cmd: WalletCmd,
+    },
 }
 
-fn section(t: &str) {
-    println!("\n━━ {t} {}", "━".repeat(70usize.saturating_sub(t.len())));
+#[derive(Subcommand)]
+enum WalletCmd {
+    /// Generate a new ML-DSA-65 key file.
+    New {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Show a key file's address.
+    Show {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Balances on both chains.
+    Balance {
+        #[arg(long, conflicts_with = "address")]
+        key: Option<PathBuf>,
+        #[arg(long)]
+        address: Option<String>,
+    },
+    /// Pay someone.
+    Send {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value = "atbash")]
+        chain: String,
+    },
+    /// Move funds to the other chain (then run `import` there).
+    Export {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value = "atbash")]
+        from: String,
+        #[arg(long, default_value = "kerckhoffs")]
+        to: String,
+    },
+    /// Claim funds exported to a chain.
+    Import {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = "kerckhoffs")]
+        chain: String,
+    },
+    /// Register a validator (stake from the Kerckhoffs Chain).
+    Stake {
+        #[arg(long)]
+        key: PathBuf,
+        /// The new validator node's key file (only its public key is used).
+        #[arg(long)]
+        node_key: PathBuf,
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Delegate stake to a validator.
+    Delegate {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Create a new asset on the Atbash Chain.
+    CreateAsset {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        supply: u64,
+    },
 }
 
-fn main() -> Result<(), String> {
-    println!("PQ-Chain testnet v0 · ML-DSA-65 (FIPS 204) · SHA3-256 · Sampled Quorum Consensus");
+fn write_json<T: serde::Serialize>(path: &Path, v: &T) -> Result<(), String> {
+    std::fs::write(path, serde_json::to_string_pretty(v).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
 
-    // ── keys ──
-    section("1. Keys (formally verified libcrux ML-DSA-65)");
-    let t = Instant::now();
-    let signing: Vec<Keypair> = (0..10).map(|_| Keypair::generate()).collect();
-    let cold: Vec<Keypair> = (0..10).map(|_| Keypair::generate()).collect();
-    let (alice, bob, carol) = (Keypair::generate(), Keypair::generate(), Keypair::generate());
-    println!("  generated 23 key pairs in {:?}", t.elapsed());
-    let s = alice.sign(ctx::ATBASH_TX, b"size probe");
-    println!(
-        "  public key {} B · signature {} B · address 32 B (SHA3-256)   [Bitcoin Schnorr: 32 B / 64 B]",
-        alice.public.bytes.len(),
-        s.bytes.len()
-    );
-    println!("  alice={} bob={} carol={}", alice.address(), bob.address(), carol.address());
+fn new_key(path: &Path) -> Result<Keypair, String> {
+    let k = Keypair::generate();
+    node::save_key(path, &k)?;
+    Ok(k)
+}
 
-    // ── genesis ──
-    section("2. Genesis: 10 Tier-1 validators, 1 full node, 1 light client");
-    let genesis = Ledger::genesis(
-        signing
-            .iter()
-            .zip(&cold)
-            .map(|(s, c)| GenesisValidator {
-                signing_key: s.public.clone(),
-                withdrawal: c.address(),
-                stake: 2_000,
-            })
-            .collect(),
-        &[(alice.address(), 1_000_000), (bob.address(), 50_000)],
-    );
-    let mut nodes: Vec<Node> = signing
-        .into_iter()
-        .enumerate()
-        .map(|(i, k)| Node {
-            name: format!("validator-{i}"),
-            role: Role::Validator,
-            key: Some(k),
-            ledger: genesis.clone(),
-        })
+#[allow(clippy::too_many_arguments)]
+fn testnet_init(
+    dir: &Path,
+    validators: usize,
+    full_nodes: usize,
+    p2p: u16,
+    rpc: u16,
+    stake: u64,
+    faucet: u64,
+) -> Result<(), String> {
+    if dir.exists() {
+        return Err(format!("{} already exists; remove it first", dir.display()));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let faucet_key = new_key(&dir.join("faucet.key"))?;
+    let mut gvals = Vec::new();
+    let names: Vec<String> = (0..validators)
+        .map(|i| format!("validator-{i}"))
+        .chain((0..full_nodes).map(|i| format!("full-{i}")))
         .collect();
-    nodes.push(Node { name: "full-node".into(), role: Role::FullNode, key: None, ledger: genesis.clone() });
-    let mut net = Network { nodes, params: Params::default(), clock: 0 };
-    println!(
-        "  total stake {} · consensus k={} alpha={} beta={} · state root {}",
-        genesis.total_weight(),
-        net.params.k,
-        net.params.alpha,
-        net.params.beta,
-        h(&genesis.state_root())
-    );
-
-    // ── Atbash Chain payment + asset ──
-    section("3. Atbash Chain: payment + new asset");
-    let l = net.ledger().clone();
-    let (base, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &alice, vec![TxOut::native(bob.address(), 250_000)], None, 0)?;
-    let pay = AtbashTx { base, create_asset: None }.sign(&vec![&alice; n]);
-    // Asset creation must spend a different UTXO: use bob's.
-    let (mut base, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &bob, vec![], None, 0)?;
-    let mut gold = AtbashTx { base: base.clone(), create_asset: Some(AssetDef { name: "GOLD".into(), supply: 1_000 }) };
-    let gold_id = gold.new_asset_id().unwrap();
-    base.outputs.push(TxOut { owner: bob.address(), asset: gold_id, amount: 1_000 });
-    gold.base = base;
-    let gold = gold.sign(&vec![&bob; n]);
-    let ts = net.tick();
-    let p = net.next_proposer(ChainId::Atbash);
-    println!("  scheduled proposer: {}", p.name);
-    let b = propose(&p.ledger, p.key.as_ref().unwrap(), Body::Atbash(vec![pay, gold]), ts);
-    report(&net.finalize(&[b], |_| 0, &[])?, "2 txs");
-    let l = net.ledger();
-    println!(
-        "  alice {} · bob {} native + {} GOLD (asset {})",
-        l.balance(ChainId::Atbash, &alice.address(), &NATIVE),
-        l.balance(ChainId::Atbash, &bob.address(), &NATIVE),
-        l.balance(ChainId::Atbash, &bob.address(), &gold_id),
-        h(&gold_id)
-    );
-
-    // ── double spend + byzantine proposer ──
-    section("4. Attack: double-spend by a byzantine proposer (20% stake byzantine)");
-    let l = net.ledger().clone();
-    let ts = net.tick();
-    let evil_name = net.next_proposer(ChainId::Atbash).name.clone();
-    let evil_idx = net.nodes.iter().position(|n| n.name == evil_name).unwrap();
-    let evil = net.nodes[evil_idx].key.as_ref().unwrap();
-    let evil_addr = evil.address();
-    let accomplice = net
-        .nodes
-        .iter()
-        .filter_map(|n| n.key.as_ref())
-        .map(|k| k.address())
-        .find(|a| *a != evil_addr)
-        .unwrap();
-    let (base_a, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &alice, vec![TxOut::native(bob.address(), 100_000)], None, 0)?;
-    let mut base_b = base_a.clone();
-    base_b.outputs[0].owner = carol.address(); // same inputs, different recipient
-    let tx_a = AtbashTx { base: base_a, create_asset: None }.sign(&vec![&alice; n]);
-    let tx_b = AtbashTx { base: base_b, create_asset: None }.sign(&vec![&alice; n]);
-    let block_a = propose(&l, evil, Body::Atbash(vec![tx_a]), ts);
-    let block_b = propose(&l, evil, Body::Atbash(vec![tx_b]), ts);
-    println!("  {evil_name} signs TWO blocks at Atbash #{}: A={} (pays bob) B={} (pays carol)", block_a.header().height, h(&block_a.hash()), h(&block_b.hash()));
-    println!("  network split 50/50 on first sight; 2 byzantine validators vote for the minority");
-    let candidates = [block_a.clone(), block_b.clone()];
-    let r = net.finalize(&candidates, |i| i % 2, &[evil_addr, accomplice])?;
-    report(&r, &format!("winner = block {}", ["A", "B"][r.winner]));
-    let l = net.ledger();
-    println!(
-        "  bob {} · carol {} → exactly one payment happened; the loser is now invalid everywhere",
-        l.balance(ChainId::Atbash, &bob.address(), &NATIVE),
-        l.balance(ChainId::Atbash, &carol.address(), &NATIVE)
-    );
-
-    // ── slashing ──
-    section("5. Kerckhoffs Chain: slash the equivocating validator");
-    let slash = KerckhoffsTx {
-        base: Transfer::default(),
-        kind: KerckhoffsKind::Slash { a: Box::new(block_a.signed.clone()), b: Box::new(block_b.signed.clone()) },
+    for (i, name) in names.iter().enumerate() {
+        let nd = dir.join(name);
+        std::fs::create_dir_all(&nd).map_err(|e| e.to_string())?;
+        let k = new_key(&nd.join("node.key"))?;
+        if i < validators {
+            let cold = new_key(&nd.join("withdrawal.key"))?;
+            gvals.push(GenesisValidatorEntry {
+                signing_key: hex::encode(&k.public.bytes),
+                withdrawal: cold.address().to_text(),
+                stake,
+            });
+        }
+        // Validator i dials validators 0..i; full nodes dial every validator.
+        let dial = if i < validators { i } else { validators };
+        let cfg = NodeConfig {
+            name: name.clone(),
+            key: "node.key".into(),
+            genesis: "../genesis.json".into(),
+            data_dir: "data".into(),
+            listen: format!("127.0.0.1:{}", p2p as usize + i),
+            rpc: format!("127.0.0.1:{}", rpc as usize + i),
+            peers: (0..dial).map(|j| format!("127.0.0.1:{}", p2p as usize + j)).collect(),
+        };
+        write_json(&nd.join("config.json"), &cfg)?;
+    }
+    let genesis = Genesis {
+        network: "pqchain-local-testnet".into(),
+        validators: gvals,
+        allocations: vec![Allocation { address: faucet_key.address().to_text(), amount: faucet }],
     };
-    let ts = net.tick();
-    let p = net.next_proposer(ChainId::Kerckhoffs);
-    let b = propose(&p.ledger, p.key.as_ref().unwrap(), Body::Kerckhoffs(vec![slash]), ts);
-    report(&net.finalize(&[b], |_| 0, &[])?, "slash evidence");
-    let v = &net.ledger().validators[&evil_addr];
-    println!("  {evil_addr}: slashed={} · burned so far {} · total stake now {}", v.slashed, net.ledger().burned, net.ledger().total_weight());
+    write_json(&dir.join("genesis.json"), &genesis)?;
+    println!("testnet created in {}", dir.display());
+    println!("  network id   {}", hex::encode(genesis.network_id()?));
+    println!("  faucet       {} ({faucet} native) key: {}", faucet_key.address().to_text(), dir.join("faucet.key").display());
+    for (i, n) in names.iter().enumerate() {
+        println!("  {n:<12} p2p 127.0.0.1:{}  rpc http://127.0.0.1:{}", p2p as usize + i, rpc as usize + i);
+    }
+    println!("start each node with: pqchain node --config {}/<name>/config.json", dir.display());
+    Ok(())
+}
 
-    // ── cross-chain staking ──
-    section("6. Cross-chain: Atbash → Kerckhoffs export/import, new validator + delegator");
-    let new_val = Keypair::generate();
-    let new_cold = Keypair::generate();
-    let l = net.ledger().clone();
-    let (base, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &alice, vec![], Some((ChainId::Kerckhoffs, vec![TxOut::native(alice.address(), 10_000)])), 0)?;
-    let ex1 = AtbashTx { base, create_asset: None }.sign(&vec![&alice; n]);
-    let (base, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &bob, vec![], Some((ChainId::Kerckhoffs, vec![TxOut::native(bob.address(), 1_000)])), 0)?;
-    let ex2 = AtbashTx { base, create_asset: None }.sign(&vec![&bob; n]);
-    let ts = net.tick();
-    let p = net.next_proposer(ChainId::Atbash);
-    let b = propose(&p.ledger, p.key.as_ref().unwrap(), Body::Atbash(vec![ex1, ex2]), ts);
-    report(&net.finalize(&[b], |_| 0, &[])?, "2 exports into atomic memory");
-
-    let l = net.ledger().clone();
-    let (base, n) = native_transfer(&l, ChainId::Kerckhoffs, Source::Atomic, &alice, vec![], None, 5_000)?;
-    let add_v = KerckhoffsTx {
-        base,
-        kind: KerckhoffsKind::AddValidator { signing_key: new_val.public.clone(), withdrawal: new_cold.address(), stake: 5_000 },
-    }
-    .sign(&vec![&alice; n]);
-    let (base, n) = native_transfer(&l, ChainId::Kerckhoffs, Source::Atomic, &bob, vec![], None, 600)?;
-    let add_d = KerckhoffsTx {
-        base,
-        kind: KerckhoffsKind::AddDelegator { node: new_val.address(), stake: 600, reward: bob.address() },
-    }
-    .sign(&vec![&bob; n]);
-    let ts = net.tick();
-    let p = net.next_proposer(ChainId::Kerckhoffs);
-    let b = propose(&p.ledger, p.key.as_ref().unwrap(), Body::Kerckhoffs(vec![add_v, add_d]), ts);
-    report(&net.finalize(&[b], |_| 0, &[])?, "import + AddValidator + AddDelegator");
-    let ledger_now = net.ledger().clone();
-    net.nodes.push(Node { name: "validator-10".into(), role: Role::Validator, key: Some(new_val), ledger: ledger_now });
-    let v = &net.ledger().validators[&net.nodes.last().unwrap().key.as_ref().unwrap().address()];
-    println!("  validator-10 joined: stake {} + delegated {} (cap {}x) · alice Kerckhoffs change {}", v.stake, v.delegated, MAX_DELEGATION_FACTOR, net.ledger().balance(ChainId::Kerckhoffs, &alice.address(), &NATIVE));
-
-    // ── attacks that must fail ──
-    section("7. Attacks that must be rejected");
-    let l = net.ledger().clone();
-    let check = |name: &str, r: Result<(), String>| match r {
-        Err(e) => println!("  ✔ rejected  {name}: {e}"),
-        Ok(()) => println!("  ✘ ACCEPTED  {name}  <-- BUG"),
-    };
-    // a) carol tries to spend alice's coins with her own key
-    let (mut base, _) = native_transfer(&l, ChainId::Atbash, Source::Local, &alice, vec![TxOut::native(carol.address(), 5)], None, 0)?;
-    for i in &mut base.inputs {
-        i.pubkey = carol.public.clone();
-    }
-    let n = base.inputs.len();
-    check("theft with wrong key", l.clone().apply_atbash(&AtbashTx { base, create_asset: None }.sign(&vec![&carol; n])));
-    // b) valid tx, then one bit of the signature flipped
-    let (base, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &alice, vec![TxOut::native(carol.address(), 5)], None, 0)?;
-    let mut tx = AtbashTx { base, create_asset: None }.sign(&vec![&alice; n]);
-    tx.base.inputs[0].sig.bytes[100] ^= 1;
-    check("forged signature (1 bit flipped)", l.clone().apply_atbash(&tx));
-    // c) signature replay across chains (Atbash signature used on Kerckhoffs Chain)
-    let (base, n) = native_transfer(&l, ChainId::Kerckhoffs, Source::Local, &alice, vec![], None, 0)?;
-    let mut ptx = KerckhoffsTx { base, kind: KerckhoffsKind::Transfer };
-    let id = ptx.id();
-    for i in &mut ptx.base.inputs {
-        i.sig = alice.sign(ctx::ATBASH_TX, &id);
-    }
-    let _ = n;
-    check("cross-chain signature replay", l.clone().apply_kerckhoffs(&ptx));
-    // d) printing money
-    let (mut base, n) = native_transfer(&l, ChainId::Atbash, Source::Local, &bob, vec![TxOut::native(carol.address(), 10)], None, 0)?;
-    base.outputs[0].amount = 10_000_000;
-    check("outputs exceed inputs", l.clone().apply_atbash(&AtbashTx { base, create_asset: None }.sign(&vec![&bob; n])));
-    // e) delegation beyond the 5x cap
-    let (base, n) = native_transfer(&l, ChainId::Kerckhoffs, Source::Local, &alice, vec![], None, 0)
-        .map(|(mut b, n)| {
-            b.outputs.clear();
-            (b, n)
-        })?;
-    let vid = net.nodes.last().unwrap().key.as_ref().unwrap().address();
-    let mut big = KerckhoffsTx { base, kind: KerckhoffsKind::AddDelegator { node: vid, stake: 4_000, reward: alice.address() } };
-    big = big.sign(&vec![&alice; n]);
-    let mut near_cap = l.clone(); // validator already holding 24,000 of its 25,000 cap
-    near_cap.validators.get_mut(&vid).unwrap().delegated = 24_000;
-    check("delegation over 5x cap", near_cap.apply_kerckhoffs(&big));
-    // f) block from an unscheduled proposer
-    let sched = net.next_proposer(ChainId::Atbash).key.as_ref().unwrap().address();
-    let rogue = net.nodes.iter().filter_map(|n| n.key.as_ref()).find(|k| k.address() != sched && !l.validators[&k.address()].slashed).unwrap();
-    let rb = propose(&l, rogue, Body::Atbash(vec![]), 99);
-    check("block from unscheduled proposer", l.clone().apply_block(&rb));
-    // g) the slashed validator can no longer propose
-    let sb = propose(&l, net.nodes[evil_idx].key.as_ref().unwrap(), Body::Atbash(vec![]), 99);
-    check("block from slashed validator", l.clone().apply_block(&sb));
-    // h) light client given a certificate signed by too little stake
-    let mut cert = pqchain::consensus::FinalityCert::new(ChainId::Atbash, 99, [7u8; 32]);
-    cert.add_vote(rogue);
-    check("light client: 1-vote certificate", LightClient::from_ledger(&l).verify(&cert).map(|_| ()));
-
-    // ── summary ──
-    section("8. Replica agreement");
-    let roots: Vec<_> = net.nodes.iter().map(|n| (n.name.clone(), n.ledger.state_root())).collect();
-    let all_same = roots.iter().all(|(_, r)| *r == roots[0].1);
-    for (n, r) in &roots {
-        print!("{n}={} ", h(r));
-    }
-    println!("\n  {} — all {} replicas {}", if all_same { "✔" } else { "✘" }, roots.len(), if all_same { "hold identical state" } else { "DIVERGED" });
-    let l = net.ledger();
-    println!(
-        "  Atbash height {} · Kerckhoffs height {} · {} active validators · stake {} · burned {}",
-        l.tip(ChainId::Atbash).0,
-        l.tip(ChainId::Kerckhoffs).0,
-        l.validators.values().filter(|v| !v.slashed).count(),
-        l.total_weight(),
-        l.burned
-    );
-    if !all_same {
-        return Err("replicas diverged".into());
+fn print_balance(c: &Client, a: &Address) -> Result<(), String> {
+    println!("{}", a.to_text());
+    for chain in ["atbash", "kerckhoffs"] {
+        let v = c.get(&format!("/balance/{chain}/{}", a.to_text()))?;
+        println!("  {chain:<11} {}  pending import: {}", v["assets"], v["pending_import"]);
     }
     Ok(())
+}
+
+fn submit(c: &Client, tx: pqchain::codec::Tx) -> Result<(), String> {
+    let r = c.submit(&tx)?;
+    println!("submitted {} tx {}", r["chain"].as_str().unwrap_or("?"), r["txid"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
+    let c = Client::new(rpc);
+    match cmd {
+        WalletCmd::New { out } => {
+            let k = new_key(&out)?;
+            println!("{}  (saved to {})", k.address().to_text(), out.display());
+        }
+        WalletCmd::Show { key } => println!("{}", node::load_key(&key)?.address().to_text()),
+        WalletCmd::Balance { key, address } => {
+            let a = match (key, address) {
+                (Some(k), _) => node::load_key(&k)?.address(),
+                (None, Some(a)) => Address::from_text(&a)?,
+                _ => return Err("pass --key or --address".into()),
+            };
+            print_balance(&c, &a)?;
+        }
+        WalletCmd::Send { key, to, amount, chain } => {
+            let k = node::load_key(&key)?;
+            submit(&c, wallet::send(&c, &k, chain_from_str(&chain)?, Address::from_text(&to)?, amount)?)?;
+        }
+        WalletCmd::Export { key, amount, from, to } => {
+            let k = node::load_key(&key)?;
+            submit(&c, wallet::export(&c, &k, chain_from_str(&from)?, chain_from_str(&to)?, amount)?)?;
+        }
+        WalletCmd::Import { key, chain } => {
+            let k = node::load_key(&key)?;
+            submit(&c, wallet::import(&c, &k, chain_from_str(&chain)?)?)?;
+        }
+        WalletCmd::Stake { key, node_key, amount } => {
+            let k = node::load_key(&key)?;
+            let nk: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&node_key).map_err(|e| format!("{}: {e}", node_key.display()))?,
+            )
+            .map_err(|e| e.to_string())?;
+            let pk = PublicKey {
+                alg: ALG_ML_DSA_65,
+                bytes: hex::decode(nk["public_key"].as_str().ok_or("node key has no public_key")?)
+                    .map_err(|e| e.to_string())?,
+            };
+            println!("new validator node id {}", pk.address().to_text());
+            submit(&c, wallet::stake(&c, &k, pk, amount)?)?;
+        }
+        WalletCmd::Delegate { key, node, amount } => {
+            let k = node::load_key(&key)?;
+            submit(&c, wallet::delegate(&c, &k, Address::from_text(&node)?, amount)?)?;
+        }
+        WalletCmd::CreateAsset { key, name, supply } => {
+            let k = node::load_key(&key)?;
+            let (tx, id) = wallet::create_asset(&c, &k, &name, supply)?;
+            println!("asset {name} id {}", hex::encode(id));
+            submit(&c, tx)?;
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let r = match cli.cmd {
+        Cmd::Demo => demo::run(),
+        Cmd::TestnetInit { dir, validators, full_nodes, p2p_port, rpc_port, stake, faucet } => {
+            testnet_init(&dir, validators, full_nodes, p2p_port, rpc_port, stake, faucet)
+        }
+        Cmd::Node { config } => tokio::runtime::Runtime::new()
+            .map_err(|e| e.to_string())
+            .and_then(|rt| rt.block_on(node::run(&config))),
+        Cmd::Wallet { rpc, cmd } => wallet_cmd(&rpc, cmd),
+    };
+    if let Err(e) = r {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
 }

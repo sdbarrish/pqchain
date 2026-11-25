@@ -145,7 +145,7 @@ pub fn sampled_quorum(voters: &[Voter], n_candidates: usize, p: Params) -> Outco
 
 // ───────────────────────── finality certificates ─────────────────────────
 
-fn vote_msg(chain: ChainId, height: u64, block: &Hash) -> Hash {
+pub fn vote_msg(chain: ChainId, height: u64, block: &Hash) -> Hash {
     Enc::new("pqchain/vote").u8(chain.tag()).u64(height).bytes(block).hash()
 }
 
@@ -182,9 +182,12 @@ pub struct LightClient {
 
 impl LightClient {
     pub fn from_ledger(l: &Ledger) -> Self {
+        Self::from_validators(&l.validators)
+    }
+
+    pub fn from_validators(set: &crate::ledger::ValidatorSet) -> Self {
         LightClient {
-            validators: l
-                .validators
+            validators: set
                 .values()
                 .filter(|v| !v.slashed)
                 .map(|v| (v.node_id, (v.signing_key.clone(), v.weight())))

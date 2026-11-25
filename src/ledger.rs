@@ -4,6 +4,9 @@
 
 use crate::crypto::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+pub type ValidatorSet = BTreeMap<Address, Validator>;
 
 pub type AssetId = Hash;
 pub const NATIVE: AssetId = [0u8; 32];
@@ -243,6 +246,12 @@ pub struct BlockHeader {
     pub tx_root: Hash,
     pub proposer: Address,
     pub timestamp: u64,
+    /// Proposal round: if the scheduled proposer is offline, the proposer for
+    /// round 1, 2, ... takes over after a timeout.
+    pub round: u32,
+    /// Kerckhoffs Chain height whose validator set governs this block. Makes
+    /// validity independent of the order in which chains are accepted.
+    pub anchor: u64,
 }
 
 impl BlockHeader {
@@ -254,6 +263,8 @@ impl BlockHeader {
             .bytes(&self.tx_root)
             .bytes(&self.proposer.0)
             .u64(self.timestamp)
+            .u64(self.round as u64)
+            .u64(self.anchor)
             .hash()
     }
 }
@@ -334,10 +345,14 @@ pub struct Ledger {
     pub kerckhoffs_utxos: BTreeMap<OutPoint, TxOut>,
     /// (destination chain, outpoint) -> output waiting to be imported.
     pub atomic: BTreeMap<(ChainId, OutPoint), TxOut>,
-    pub validators: BTreeMap<Address, Validator>,
+    pub validators: ValidatorSet,
+    /// Snapshot of the validator set after each Kerckhoffs block (shared, cheap to clone).
+    pub validator_history: BTreeMap<u64, Arc<ValidatorSet>>,
     pub delegations: Vec<Delegation>,
     pub burned: u64,
     pub tips: BTreeMap<ChainId, (u64, Hash)>,
+    /// Anchor of the last accepted block on each chain (must not go backwards).
+    pub anchors: BTreeMap<ChainId, u64>,
 }
 
 pub struct GenesisValidator {
@@ -369,7 +384,9 @@ impl Ledger {
         }
         for c in [ChainId::Kerckhoffs, ChainId::Atbash] {
             l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u8(c.tag()).hash()));
+            l.anchors.insert(c, 0);
         }
+        l.validator_history.insert(0, Arc::new(l.validators.clone()));
         l
     }
 
@@ -379,6 +396,16 @@ impl Ledger {
 
     pub fn total_weight(&self) -> u64 {
         self.validators.values().map(Validator::weight).sum()
+    }
+
+    /// Validator set as of a Kerckhoffs height.
+    pub fn validators_at(&self, anchor: u64) -> Option<&ValidatorSet> {
+        self.validator_history.range(..=anchor).next_back().map(|(_, v)| &**v)
+    }
+
+    /// The anchor an honest proposer uses now: the local Kerckhoffs tip.
+    pub fn current_anchor(&self) -> u64 {
+        self.tip(ChainId::Kerckhoffs).0
     }
 
     /// Balance of `owner` for `asset` on a chain.
@@ -420,15 +447,29 @@ impl Ledger {
         }
     }
 
-    /// Deterministic, stake-weighted leader schedule.
-    pub fn scheduled_proposer(&self, chain: ChainId, height: u64, parent: &Hash) -> Option<Address> {
-        let total = self.total_weight();
+    /// Deterministic, stake-weighted leader schedule for (height, round),
+    /// computed over the validator set at `anchor`.
+    pub fn scheduled_proposer(
+        &self,
+        chain: ChainId,
+        height: u64,
+        parent: &Hash,
+        round: u32,
+        anchor: u64,
+    ) -> Option<Address> {
+        let set = self.validators_at(anchor)?;
+        let total: u64 = set.values().map(Validator::weight).sum();
         if total == 0 {
             return None;
         }
-        let seed = Enc::new("pqchain/leader").u8(chain.tag()).u64(height).bytes(parent).hash();
+        let seed = Enc::new("pqchain/leader")
+            .u8(chain.tag())
+            .u64(height)
+            .bytes(parent)
+            .u64(round as u64)
+            .hash();
         let mut r = u64::from_le_bytes(seed[..8].try_into().unwrap()) % total;
-        for v in self.validators.values().filter(|v| !v.slashed) {
+        for v in set.values().filter(|v| !v.slashed) {
             if r < v.weight() {
                 return Some(v.node_id);
             }
@@ -598,7 +639,11 @@ impl Ledger {
     /// same chain and height = provable equivocation.
     pub fn check_equivocation(&self, a: &SignedHeader, b: &SignedHeader) -> Result<Address, String> {
         let (ha, hb) = (&a.header, &b.header);
-        if ha.chain != hb.chain || ha.height != hb.height || ha.proposer != hb.proposer {
+        if ha.chain != hb.chain
+            || ha.height != hb.height
+            || ha.round != hb.round
+            || ha.proposer != hb.proposer
+        {
             return Err("headers are not for the same slot/proposer".into());
         }
         if ha.hash() == hb.hash() {
@@ -630,12 +675,31 @@ impl Ledger {
         if h.height != tip_h + 1 || h.parent != tip_hash {
             return Err("block does not extend the current tip".into());
         }
-        let v = self
-            .validators
+        let k_tip = self.tip(ChainId::Kerckhoffs).0;
+        match h.chain {
+            ChainId::Kerckhoffs if h.anchor != k_tip => {
+                return Err("Kerckhoffs block must anchor to its parent height".into())
+            }
+            ChainId::Atbash if h.anchor > k_tip => {
+                return Err("anchor is ahead of the local Kerckhoffs tip (retry later)".into())
+            }
+            ChainId::Atbash if h.anchor < self.anchors[&ChainId::Atbash] => {
+                return Err("anchor went backwards".into())
+            }
+            _ => {}
+        }
+        let set = self.validators_at(h.anchor).ok_or("no validator set at anchor")?;
+        let v = set
             .get(&h.proposer)
             .filter(|v| !v.slashed)
             .ok_or("proposer is not an active validator")?;
-        if self.scheduled_proposer(h.chain, h.height, &h.parent) != Some(h.proposer) {
+        // A validator slashed since the anchor may not propose either.
+        if self.validators.get(&h.proposer).is_none_or(|v| v.slashed) {
+            return Err("proposer is not an active validator".into());
+        }
+        if self.scheduled_proposer(h.chain, h.height, &h.parent, h.round, h.anchor)
+            != Some(h.proposer)
+        {
             return Err("proposer is not scheduled for this slot".into());
         }
         if !v.signing_key.verify(ctx::BLOCK, &h.hash(), &b.signed.sig) {
@@ -658,6 +722,10 @@ impl Ledger {
             _ => return Err("body does not match chain".into()),
         }
         self.tips.insert(h.chain, (h.height, h.hash()));
+        self.anchors.insert(h.chain, h.anchor);
+        if h.chain == ChainId::Kerckhoffs {
+            self.validator_history.insert(h.height, Arc::new(self.validators.clone()));
+        }
         Ok(())
     }
 
@@ -680,15 +748,20 @@ impl Ledger {
             e.bytes(&v.node_id.0).u64(v.stake).u64(v.delegated).u8(v.slashed as u8);
         }
         for (c, (h, hash)) in &self.tips {
-            e.u8(c.tag()).u64(*h).bytes(hash);
+            e.u8(c.tag()).u64(*h).bytes(hash).u64(self.anchors[c]);
         }
         e.u64(self.burned);
         e.hash()
     }
 }
 
-/// Build and sign a block as the given proposer.
+/// Build and sign a round-0 block as the given proposer.
 pub fn propose(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64) -> Block {
+    propose_round(ledger, key, body, timestamp, 0)
+}
+
+/// Build and sign a block for a specific proposal round.
+pub fn propose_round(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64, round: u32) -> Block {
     let chain = match body {
         Body::Atbash(_) => ChainId::Atbash,
         Body::Kerckhoffs(_) => ChainId::Kerckhoffs,
@@ -701,6 +774,8 @@ pub fn propose(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64) -> Bl
         tx_root: merkle_root(&body.tx_ids()),
         proposer: key.address(),
         timestamp,
+        round,
+        anchor: ledger.current_anchor(),
     };
     let sig = key.sign(ctx::BLOCK, &header.hash());
     Block { signed: SignedHeader { header, sig }, body }

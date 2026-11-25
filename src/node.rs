@@ -62,8 +62,15 @@ fn short(h: &Hash) -> String {
 
 // ───────────────────────────── files ─────────────────────────────
 
+fn default_alg() -> String {
+    alg_name(ALG_ML_DSA_65).into()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct KeyFile {
+    /// "ML-DSA-65" (default) or "SLH-DSA-SHAKE-128s".
+    #[serde(default = "default_alg")]
+    pub algorithm: String,
     pub address: String,
     pub public_key: String,
     /// Secret: the 32-byte ML-DSA-65 seed.
@@ -72,6 +79,7 @@ pub struct KeyFile {
 
 pub fn save_key(path: &Path, k: &Keypair) -> Result<(), String> {
     let f = KeyFile {
+        algorithm: alg_name(k.alg()).into(),
         address: k.address().to_text(),
         public_key: hex::encode(&k.public.bytes),
         seed: hex::encode(k.seed()),
@@ -95,7 +103,11 @@ pub fn load_key(path: &Path) -> Result<Keypair, String> {
         .map_err(|e| e.to_string())?
         .try_into()
         .map_err(|_| "seed must be 32 bytes")?;
-    let k = Keypair::from_seed(seed);
+    let alg = [ALG_ML_DSA_65, ALG_SLH_DSA_SHAKE_128S]
+        .into_iter()
+        .find(|a| alg_name(*a) == f.algorithm)
+        .ok_or(format!("{}: unknown algorithm {}", path.display(), f.algorithm))?;
+    let k = Keypair::from_seed_alg(alg, seed)?;
     if k.address().to_text() != f.address {
         return Err(format!("{}: seed does not match address", path.display()));
     }
@@ -451,7 +463,7 @@ impl Engine {
     }
 
     pub fn is_active_validator(&self) -> bool {
-        self.ledger.validators.get(&self.me).is_some_and(|v| !v.slashed)
+        self.ledger.validators.get(&self.me).is_some_and(|v| v.weight() > 0)
     }
 
     pub fn on_connect(&mut self, peer: Address) {

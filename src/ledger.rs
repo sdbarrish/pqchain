@@ -15,6 +15,9 @@ pub const TX_FEE: u64 = 1;
 pub const MIN_VALIDATOR_STAKE: u64 = 2_000;
 pub const MIN_DELEGATION: u64 = 25;
 pub const MAX_DELEGATION_FACTOR: u64 = 5;
+/// Kerckhoffs blocks between a validator's exit request and the release of
+/// its stake. During this window the validator can still be slashed.
+pub const UNBONDING_BLOCKS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChainId {
@@ -196,6 +199,10 @@ pub enum KerckhoffsKind {
     AddDelegator { node: Address, stake: u64, reward: Address },
     /// Proof that a validator signed two different blocks at the same height.
     Slash { a: Box<SignedHeader>, b: Box<SignedHeader> },
+    /// Validator leaves the set. Must be signed by the key behind the
+    /// validator's cold withdrawal address (typically SLH-DSA). Stake is
+    /// released to that address after `UNBONDING_BLOCKS`.
+    Exit { node: Address, authority: PublicKey, sig: Signature },
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +232,10 @@ impl KerckhoffsTx {
                 .bytes(&a.sig.bytes)
                 .bytes(&b.header.hash())
                 .bytes(&b.sig.bytes),
+            // The exit signature itself is excluded so it can sign the txid.
+            KerckhoffsKind::Exit { node, authority, .. } => {
+                e.u8(4).bytes(&node.0).u8(authority.alg).bytes(&authority.bytes)
+            }
         };
         e.hash()
     }
@@ -233,6 +244,23 @@ impl KerckhoffsTx {
         let id = self.id();
         self.base.sign_all(ctx::KERCKHOFFS_TX, &id, keys);
         self
+    }
+
+    /// Build a validator exit signed by the withdrawal (cold) key.
+    pub fn exit(node: Address, withdrawal_key: &Keypair) -> Self {
+        let mut tx = KerckhoffsTx {
+            base: Transfer::default(),
+            kind: KerckhoffsKind::Exit {
+                node,
+                authority: withdrawal_key.public.clone(),
+                sig: Signature::empty(),
+            },
+        };
+        let id = tx.id();
+        if let KerckhoffsKind::Exit { sig, .. } = &mut tx.kind {
+            *sig = withdrawal_key.sign(ctx::EXIT, &id);
+        }
+        tx
     }
 }
 
@@ -318,11 +346,14 @@ pub struct Validator {
     pub stake: u64,
     pub delegated: u64,
     pub slashed: bool,
+    /// Kerckhoffs height at which an exiting validator's stake is released.
+    pub exit_at: Option<u64>,
 }
 
 impl Validator {
+    /// Voting / proposing weight. Slashed and exiting validators have none.
     pub fn weight(&self) -> u64 {
-        if self.slashed {
+        if self.slashed || self.exit_at.is_some() {
             0
         } else {
             self.stake + self.delegated
@@ -379,6 +410,7 @@ impl Ledger {
                     stake: gv.stake,
                     delegated: 0,
                     slashed: false,
+                    exit_at: None,
                 },
             );
         }
@@ -570,7 +602,8 @@ impl Ledger {
         let n_in = ins.get(&NATIVE).copied().unwrap_or(0);
         let n_out = outs.get(&NATIVE).copied().unwrap_or(0);
         let (stake, fee) = match &tx.kind {
-            KerckhoffsKind::Slash { .. } => (0, 0), // reporting misbehaviour is free
+            // Reporting misbehaviour is free; an exit is authorized by its signature.
+            KerckhoffsKind::Slash { .. } | KerckhoffsKind::Exit { .. } => (0, 0),
             KerckhoffsKind::AddValidator { stake, .. } | KerckhoffsKind::AddDelegator { stake, .. } => (*stake, TX_FEE),
             KerckhoffsKind::Transfer => (0, TX_FEE),
         };
@@ -585,6 +618,9 @@ impl Ledger {
                 if *stake < MIN_VALIDATOR_STAKE {
                     return Err(format!("validator stake below minimum {MIN_VALIDATOR_STAKE}"));
                 }
+                if signing_key.alg != ALG_ML_DSA_65 {
+                    return Err("validator block-signing keys must be ML-DSA-65 (fast hot key)".into());
+                }
                 let node_id = signing_key.address();
                 if self.validators.contains_key(&node_id) {
                     return Err("validator already registered".into());
@@ -598,6 +634,7 @@ impl Ledger {
                         stake: *stake,
                         delegated: 0,
                         slashed: false,
+                        exit_at: None,
                     },
                 );
             }
@@ -606,8 +643,8 @@ impl Ledger {
                     return Err(format!("delegation below minimum {MIN_DELEGATION}"));
                 }
                 let v = self.validators.get_mut(node).ok_or("unknown validator")?;
-                if v.slashed {
-                    return Err("validator is slashed".into());
+                if v.slashed || v.exit_at.is_some() {
+                    return Err("validator is slashed or exiting".into());
                 }
                 if v.delegated + stake > v.stake * MAX_DELEGATION_FACTOR {
                     return Err(format!("delegation cap ({MAX_DELEGATION_FACTOR}x own stake) exceeded"));
@@ -631,8 +668,43 @@ impl Ledger {
                 }
                 v.delegated = 0;
             }
+            KerckhoffsKind::Exit { node, authority, sig } => {
+                let release = self.tip(ChainId::Kerckhoffs).0 + 1 + UNBONDING_BLOCKS;
+                let v = self.validators.get_mut(node).ok_or("unknown validator")?;
+                if v.slashed || v.exit_at.is_some() {
+                    return Err("validator is already slashed or exiting".into());
+                }
+                if authority.address() != v.withdrawal {
+                    return Err("exit must be signed by the validator's withdrawal key".into());
+                }
+                if !authority.verify(ctx::EXIT, &id, sig) {
+                    return Err("invalid exit signature".into());
+                }
+                v.exit_at = Some(release);
+            }
         }
         Ok(())
+    }
+
+    /// Release stake of validators whose unbonding period ended at `height`.
+    fn release_unbonded(&mut self, height: u64) {
+        let done: Vec<Address> = self
+            .validators
+            .values()
+            .filter(|v| !v.slashed && v.exit_at.is_some_and(|h| h <= height))
+            .map(|v| v.node_id)
+            .collect();
+        for node in done {
+            let v = self.validators.remove(&node).unwrap();
+            let txid = Enc::new("pqchain/unbond").bytes(&node.0).u64(height).hash();
+            self.kerckhoffs_utxos.insert(OutPoint { txid, index: 0 }, TxOut::native(v.withdrawal, v.stake));
+            let (refund, keep): (Vec<_>, Vec<_>) = self.delegations.drain(..).partition(|d| d.node == node);
+            self.delegations = keep;
+            for (i, d) in refund.into_iter().enumerate() {
+                self.kerckhoffs_utxos
+                    .insert(OutPoint { txid, index: 1 + i as u32 }, TxOut::native(d.reward, d.stake));
+            }
+        }
     }
 
     /// Two validly signed, different headers from the same proposer for the
@@ -724,6 +796,7 @@ impl Ledger {
         self.tips.insert(h.chain, (h.height, h.hash()));
         self.anchors.insert(h.chain, h.anchor);
         if h.chain == ChainId::Kerckhoffs {
+            self.release_unbonded(h.height);
             self.validator_history.insert(h.height, Arc::new(self.validators.clone()));
         }
         Ok(())
@@ -745,7 +818,7 @@ impl Ledger {
             o.encode(&mut e);
         }
         for v in self.validators.values() {
-            e.bytes(&v.node_id.0).u64(v.stake).u64(v.delegated).u8(v.slashed as u8);
+            e.bytes(&v.node_id.0).u64(v.stake).u64(v.delegated).u8(v.slashed as u8).u64(v.exit_at.unwrap_or(0));
         }
         for (c, (h, hash)) in &self.tips {
             e.u8(c.tag()).u64(*h).bytes(hash).u64(self.anchors[c]);

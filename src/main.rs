@@ -55,10 +55,13 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum WalletCmd {
-    /// Generate a new ML-DSA-65 key file.
+    /// Generate a new key file (ML-DSA-65, or SLH-DSA with --cold).
     New {
         #[arg(long)]
         out: PathBuf,
+        /// Hash-based SLH-DSA-SHAKE-128s key for cold storage (e.g. validator withdrawal).
+        #[arg(long)]
+        cold: bool,
     },
     /// Show a key file's address.
     Show {
@@ -120,6 +123,15 @@ enum WalletCmd {
         #[arg(long)]
         amount: u64,
     },
+    /// Start a validator's exit (signed by its cold withdrawal key).
+    Exit {
+        /// Withdrawal key file of the validator.
+        #[arg(long)]
+        withdrawal_key: PathBuf,
+        /// Validator node id (pq1...).
+        #[arg(long)]
+        node: String,
+    },
     /// Create a new asset on the Atbash Chain.
     CreateAsset {
         #[arg(long)]
@@ -167,7 +179,9 @@ fn testnet_init(
         std::fs::create_dir_all(&nd).map_err(|e| e.to_string())?;
         let k = new_key(&nd.join("node.key"))?;
         if i < validators {
-            let cold = new_key(&nd.join("withdrawal.key"))?;
+            // Cold withdrawal key: hash-based SLH-DSA, kept offline.
+            let cold = Keypair::generate_slh();
+            node::save_key(&nd.join("withdrawal.key"), &cold)?;
             gvals.push(GenesisValidatorEntry {
                 signing_key: hex::encode(&k.public.bytes),
                 withdrawal: cold.address().to_text(),
@@ -221,9 +235,14 @@ fn submit(c: &Client, tx: pqchain::codec::Tx) -> Result<(), String> {
 fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
     let c = Client::new(rpc);
     match cmd {
-        WalletCmd::New { out } => {
-            let k = new_key(&out)?;
-            println!("{}  (saved to {})", k.address().to_text(), out.display());
+        WalletCmd::New { out, cold } => {
+            let k = if cold { Keypair::generate_slh() } else { Keypair::generate() };
+            node::save_key(&out, &k)?;
+            println!("{}  {} (saved to {})", k.address().to_text(), pqchain::crypto::alg_name(k.alg()), out.display());
+        }
+        WalletCmd::Exit { withdrawal_key, node } => {
+            let k = node::load_key(&withdrawal_key)?;
+            submit(&c, wallet::exit(Address::from_text(&node)?, &k))?;
         }
         WalletCmd::Show { key } => println!("{}", node::load_key(&key)?.address().to_text()),
         WalletCmd::Balance { key, address } => {

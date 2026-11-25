@@ -50,6 +50,7 @@ async fn validators(State(e): State<Shared>) -> Json<Value> {
             json!({
                 "node_id": v.node_id.to_text(), "stake": v.stake, "delegated": v.delegated,
                 "weight": v.weight(), "slashed": v.slashed, "withdrawal": v.withdrawal.to_text(),
+                "exit_at": v.exit_at,
                 "connected": e.peers.contains_key(&v.node_id) || v.node_id == e.me,
             })
         })

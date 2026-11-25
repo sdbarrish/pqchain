@@ -331,6 +331,12 @@ impl Wire for KerckhoffsTx {
                 a.put(w);
                 b.put(w);
             }
+            KerckhoffsKind::Exit { node, authority, sig } => {
+                w.u8(4);
+                node.put(w);
+                authority.put(w);
+                sig.put(w);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
@@ -350,6 +356,11 @@ impl Wire for KerckhoffsTx {
             3 => KerckhoffsKind::Slash {
                 a: Box::new(SignedHeader::get(r)?),
                 b: Box::new(SignedHeader::get(r)?),
+            },
+            4 => KerckhoffsKind::Exit {
+                node: Address::get(r)?,
+                authority: PublicKey::get(r)?,
+                sig: Signature::get(r)?,
             },
             _ => return Err("unknown Kerckhoffs tx kind".into()),
         };

@@ -189,7 +189,7 @@ impl LightClient {
         LightClient {
             validators: set
                 .values()
-                .filter(|v| !v.slashed)
+                .filter(|v| v.weight() > 0)
                 .map(|v| (v.node_id, (v.signing_key.clone(), v.weight())))
                 .collect(),
         }

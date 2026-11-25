@@ -117,6 +117,12 @@ pub fn delegate(c: &Client, key: &Keypair, node: Address, amount: u64) -> Result
     Ok(wrap(ChainId::Kerckhoffs, base, kind, n, key))
 }
 
+/// Ask for a validator to leave; signed by its (cold) withdrawal key. The
+/// stake returns to the withdrawal address after the unbonding period.
+pub fn exit(node: Address, withdrawal_key: &Keypair) -> Tx {
+    Tx::Kerckhoffs(KerckhoffsTx::exit(node, withdrawal_key))
+}
+
 /// Create a new asset on the Atbash Chain; the whole supply goes to the creator.
 pub fn create_asset(c: &Client, key: &Keypair, name: &str, supply: u64) -> Result<(Tx, AssetId), String> {
     let pool = native_only(c.utxos(ChainId::Atbash, &key.address())?);

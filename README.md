@@ -19,7 +19,7 @@ Each chain is named after a piece of cryptographic history:
 
 | Area | Implementation |
 |---|---|
-| Signatures | ML-DSA-65 (NIST FIPS 204) from **libcrux**, which is formally verified. Algorithm ID byte on every key and signature. Domain-separated contexts per message type. |
+| Signatures | ML-DSA-65 (NIST FIPS 204) from **libcrux**, which is formally verified, for hot keys; SLH-DSA-SHAKE-128s (FIPS 205, hash-based) for cold keys such as validator withdrawal keys. Algorithm ID byte on every key and signature. Domain-separated contexts per message type. |
 | Hashing | SHA3-256 (FIPS 202). 256-bit addresses; Merkle roots; canonical length-prefixed encoding. |
 | Atbash Chain | UTXO payments, user-created assets, exports to other chains |
 | Kerckhoffs Chain | Validator registry, staking (min 2,000), delegation (min 25, cap 5x own stake), slashing for equivocation (stake burned, delegators refunded) |
@@ -88,7 +88,8 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 
 - **v1 (done, milestone 1)**: real P2P with hybrid post-quantum transport, consensus over the network, finality certificates, persistent storage, sync, RPC, wallet CLI, multi-process testnet
 - **v1 milestone 2**: Feistel Chain (smart contracts with PQ accounts), staking rewards and expiry, sentry nodes, peer discovery, state snapshots (no full replay), Docker images
-- **v2**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
+- **v2 step 1 (done)**: SLH-DSA (FIPS 205, hash-based) cold keys; validator exit authorized by the cold withdrawal key, with a 10-block unbonding period during which misbehaviour is still slashable
+- **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
 - **v3**: Hamming Chain (hash-based data availability), Playfair Chain bridges, fuzzing, formal verification (Kani/Verus), external audits
 
 ## Credits

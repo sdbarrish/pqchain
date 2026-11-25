@@ -7,6 +7,7 @@ edition = "2024"
 axum = "0.8.9"
 chacha20poly1305 = "0.10"
 clap = { version = "4.6.10", features = ["derive"] }
+fips205 = "0.5"
 hex = "0.4.3"
 libcrux-ml-dsa = "0.0.12"
 libcrux-ml-kem = "0.0.12"

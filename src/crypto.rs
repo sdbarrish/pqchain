@@ -8,6 +8,8 @@
 //! Every key and signature carries an algorithm ID byte (crypto agility), so a
 //! scheme can be replaced later by a fork without changing the data model.
 
+use fips205::slh_dsa_shake_128s as slh;
+use fips205::traits::{KeyGen as _, SerDes as _, Signer as _, Verifier as _};
 use libcrux_ml_dsa::ml_dsa_65::{
     self, MLDSA65KeyPair, MLDSA65Signature, MLDSA65VerificationKey,
 };
@@ -16,10 +18,24 @@ use std::fmt;
 
 pub type Hash = [u8; 32];
 
-/// Algorithm IDs. Only ML-DSA-65 is enabled in testnet v0.
+/// Algorithm IDs (crypto agility).
+/// * ML-DSA-65 (FIPS 204, lattice): fast; used for hot keys (blocks, votes, wallets).
+/// * SLH-DSA-SHAKE-128s (FIPS 205, hash-based): relies only on hash security;
+///   slow, large signatures; used for cold keys such as validator withdrawal keys.
 pub const ALG_ML_DSA_65: u8 = 0x01;
+pub const ALG_SLH_DSA_SHAKE_128S: u8 = 0x02;
 pub const VK_LEN: usize = 1952;
 pub const SIG_LEN: usize = 3309;
+pub const SLH_PK_LEN: usize = slh::PK_LEN;
+pub const SLH_SIG_LEN: usize = slh::SIG_LEN;
+
+pub fn alg_name(alg: u8) -> &'static str {
+    match alg {
+        ALG_ML_DSA_65 => "ML-DSA-65",
+        ALG_SLH_DSA_SHAKE_128S => "SLH-DSA-SHAKE-128s",
+        _ => "unknown",
+    }
+}
 
 /// Domain-separation contexts (FIPS 204 `ctx` parameter). A signature made
 /// for one purpose can never be replayed as another.
@@ -28,6 +44,7 @@ pub mod ctx {
     pub const KERCKHOFFS_TX: &[u8] = b"pqchain/v0/kerckhoffs/tx";
     pub const BLOCK: &[u8] = b"pqchain/v0/block";
     pub const VOTE: &[u8] = b"pqchain/v0/finality-vote";
+    pub const EXIT: &[u8] = b"pqchain/v2/validator-exit";
 }
 
 /// Canonical, length-prefixed encoder used for every hash in the protocol.
@@ -141,9 +158,30 @@ impl PublicKey {
 
     /// Verify; any malformed key/signature or unknown algorithm is a rejection.
     pub fn verify(&self, context: &[u8], msg: &[u8], sig: &Signature) -> bool {
-        if self.alg != ALG_ML_DSA_65 || sig.alg != ALG_ML_DSA_65 {
+        if self.alg != sig.alg {
             return false;
         }
+        match self.alg {
+            ALG_ML_DSA_65 => self.verify_ml_dsa(context, msg, sig),
+            ALG_SLH_DSA_SHAKE_128S => self.verify_slh_dsa(context, msg, sig),
+            _ => false,
+        }
+    }
+
+    fn verify_slh_dsa(&self, context: &[u8], msg: &[u8], sig: &Signature) -> bool {
+        let Ok(pk) = <[u8; SLH_PK_LEN]>::try_from(self.bytes.as_slice()) else {
+            return false;
+        };
+        let Ok(s) = <[u8; SLH_SIG_LEN]>::try_from(sig.bytes.as_slice()) else {
+            return false;
+        };
+        match slh::PublicKey::try_from_bytes(pk) {
+            Ok(pk) => pk.verify(msg, &s, context),
+            Err(_) => false,
+        }
+    }
+
+    fn verify_ml_dsa(&self, context: &[u8], msg: &[u8], sig: &Signature) -> bool {
         let Ok(vk) = <[u8; VK_LEN]>::try_from(self.bytes.as_slice()) else {
             return false;
         };
@@ -160,10 +198,16 @@ impl PublicKey {
     }
 }
 
-/// An ML-DSA-65 key pair. Randomness comes from `rand`'s CSPRNG (seeded by the
-/// OS). Production builds should use a hardware RNG / HSM.
+enum Secret {
+    MlDsa(Box<MLDSA65KeyPair>),
+    SlhDsa(Box<slh::PrivateKey>),
+}
+
+/// A signing key pair (ML-DSA-65 by default, or SLH-DSA for cold keys).
+/// Randomness comes from `rand`'s CSPRNG (seeded by the OS). Production
+/// builds should use a hardware RNG / HSM.
 pub struct Keypair {
-    kp: MLDSA65KeyPair,
+    secret: Secret,
     pub public: PublicKey,
     seed: [u8; 32],
 }
@@ -175,15 +219,45 @@ impl Keypair {
         Self::from_seed(seed)
     }
 
-    /// Deterministic key pair from a 32-byte seed (the seed is the secret
-    /// that key files store).
+    /// Generate a hash-based SLH-DSA key (for cold storage).
+    pub fn generate_slh() -> Self {
+        let mut seed = [0u8; 32];
+        rand::fill(&mut seed);
+        Self::from_seed_alg(ALG_SLH_DSA_SHAKE_128S, seed).expect("valid algorithm")
+    }
+
+    /// Deterministic ML-DSA-65 key pair from a 32-byte seed (the seed is the
+    /// secret that key files store).
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        let kp = ml_dsa_65::generate_key_pair(seed);
-        let public = PublicKey {
-            alg: ALG_ML_DSA_65,
-            bytes: kp.verification_key.as_slice().to_vec(),
-        };
-        Keypair { kp, public, seed }
+        Self::from_seed_alg(ALG_ML_DSA_65, seed).expect("valid algorithm")
+    }
+
+    pub fn from_seed_alg(alg: u8, seed: [u8; 32]) -> Result<Self, String> {
+        match alg {
+            ALG_ML_DSA_65 => {
+                let kp = ml_dsa_65::generate_key_pair(seed);
+                let public = PublicKey { alg, bytes: kp.verification_key.as_slice().to_vec() };
+                Ok(Keypair { secret: Secret::MlDsa(Box::new(kp)), public, seed })
+            }
+            ALG_SLH_DSA_SHAKE_128S => {
+                // Expand the 32-byte seed into FIPS 205's three n-byte seeds.
+                let part = |tag: &str| -> [u8; slh::N] {
+                    Enc::new(tag).bytes(&seed).hash()[..slh::N].try_into().unwrap()
+                };
+                let (pk, sk) = slh::KG::keygen_from_seed(
+                    &part("pqchain/slh/sk-seed"),
+                    &part("pqchain/slh/sk-prf"),
+                    &part("pqchain/slh/pk-seed"),
+                );
+                let public = PublicKey { alg, bytes: pk.into_bytes().to_vec() };
+                Ok(Keypair { secret: Secret::SlhDsa(Box::new(sk)), public, seed })
+            }
+            _ => Err(format!("unknown signature algorithm {alg}")),
+        }
+    }
+
+    pub fn alg(&self) -> u8 {
+        self.public.alg
     }
 
     /// The secret seed. Handle with care.
@@ -195,12 +269,20 @@ impl Keypair {
         self.public.address()
     }
 
-    /// Hedged (randomized) signing, as recommended by FIPS 204.
+    /// Hedged (randomized) signing, as recommended by FIPS 204 and FIPS 205.
     pub fn sign(&self, context: &[u8], msg: &[u8]) -> Signature {
-        let mut r = [0u8; 32];
-        rand::fill(&mut r);
-        let s = ml_dsa_65::sign(&self.kp.signing_key, msg, context, r)
-            .expect("ML-DSA-65 signing failed (context too long?)");
-        Signature { alg: ALG_ML_DSA_65, bytes: s.as_slice().to_vec() }
+        match &self.secret {
+            Secret::MlDsa(kp) => {
+                let mut r = [0u8; 32];
+                rand::fill(&mut r);
+                let s = ml_dsa_65::sign(&kp.signing_key, msg, context, r)
+                    .expect("ML-DSA-65 signing failed (context too long?)");
+                Signature { alg: ALG_ML_DSA_65, bytes: s.as_slice().to_vec() }
+            }
+            Secret::SlhDsa(sk) => {
+                let s = sk.try_sign(msg, context, true).expect("SLH-DSA signing failed");
+                Signature { alg: ALG_SLH_DSA_SHAKE_128S, bytes: s.to_vec() }
+            }
+        }
     }
 }

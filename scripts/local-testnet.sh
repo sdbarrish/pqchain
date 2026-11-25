@@ -137,6 +137,18 @@ grep -q "replayed" "$WORK/validator-2.log" || fail "validator-2 did not replay i
 ok "validator-2 restarted: $(grep replayed "$WORK/validator-2.log" | tail -1 | sed 's/^\[[^]]*\] //')"
 ok "validator-2 synced the blocks it missed"
 
+say "Validator exit signed with an SLH-DSA cold key"
+V3=$(wallet show --key "$WORK/validator-3/node.key")
+python3 -c "import json;print('  withdrawal key algorithm:', json.load(open('$WORK/validator-3/withdrawal.key'))['algorithm'])"
+wallet exit --withdrawal-key "$WORK/validator-3/withdrawal.key" --node "$V3" | sed 's/^/  /'
+wait_all kerckhoffs 5 "${ALL[@]}"
+EXIT_AT=$(rpc 8104 /validators | jget "[v['exit_at'] for v in d['validators'] if v['node_id']=='$V3'][0]")
+[ "$EXIT_AT" != "None" ] || fail "validator-3 should be unbonding"
+ok "validator-3 is unbonding (stake released at Kerckhoffs #$EXIT_AT); it no longer votes or proposes"
+wallet send --key "$WORK/alice.key" --to "$BOB" --amount 100 >/dev/null
+wait_all atbash 9 "${ALL[@]}"
+ok "network keeps finalizing without validator-3"
+
 say "Final agreement check"
 sleep 1
 ROOTS=()

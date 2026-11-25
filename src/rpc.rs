@@ -9,6 +9,10 @@
 //! GET  /inbox/{chain}/{address}     relay messages to claim, with proofs
 //! GET  /zones                       registered zones
 //! GET  /rewards/{address}           unclaimed staking rewards and claim nonce
+//! GET  /feistel/account/{address}   Feistel balance and nonce
+//! GET  /feistel/contract/{address}  contract code hash, creator, balance, storage size
+//! GET  /feistel/receipt/{txid}      result of a Feistel transaction
+//! POST /feistel/query/{address}/{method}  read-only call; body = hex input
 //! POST /tx                          hex-encoded signed transaction
 
 use crate::codec::{Tx, Wire};
@@ -121,6 +125,42 @@ async fn rewards(State(e): State<Shared>, Path(addr): Path<String>) -> Reply {
     })))
 }
 
+async fn feistel_account(State(e): State<Shared>, Path(addr): Path<String>) -> Reply {
+    let a = Address::from_text(&addr).map_err(bad)?;
+    let e = e.lock().unwrap();
+    Ok(Json(json!({ "address": a.to_text(), "balance": e.ledger.feistel.balance(&a), "nonce": e.ledger.feistel.nonce(&a) })))
+}
+
+async fn feistel_contract(State(e): State<Shared>, Path(addr): Path<String>) -> Reply {
+    let a = Address::from_text(&addr).map_err(bad)?;
+    let e = e.lock().unwrap();
+    let c = e.ledger.feistel.contracts.get(&a).ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "no contract" }))))?;
+    Ok(Json(json!({
+        "address": a.to_text(), "code_hash": hex::encode(c.code_hash), "code_bytes": c.code.len(),
+        "creator": c.creator.to_text(), "balance": e.ledger.feistel.balance(&a), "storage_entries": c.storage.len(),
+    })))
+}
+
+async fn feistel_receipt(State(e): State<Shared>, Path(txid): Path<String>) -> Reply {
+    let id: [u8; 32] = hex::decode(&txid).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| bad("txid must be 32-byte hex"))?;
+    let e = e.lock().unwrap();
+    let r = e.ledger.receipts.get(&id).ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "no receipt (not yet included?)" }))))?;
+    Ok(Json(json!({
+        "ok": r.ok, "fuel_used": r.fuel_used, "fee": r.fee, "error": r.error,
+        "output_hex": hex::encode(&r.output), "logs": r.logs.iter().map(|l| String::from_utf8_lossy(l).to_string()).collect::<Vec<_>>(),
+        "contract": r.contract.map(|a| a.to_text()),
+    })))
+}
+
+async fn feistel_query(State(e): State<Shared>, Path((addr, method)): Path<(String, String)>, body: String) -> Reply {
+    let a = Address::from_text(&addr).map_err(bad)?;
+    let input = hex::decode(body.trim()).map_err(|err| bad(err.to_string()))?;
+    let st = e.lock().unwrap().ledger.feistel.clone();
+    let out = crate::feistel::query(&st, a, &method, input).map_err(bad)?;
+    let as_u64 = <[u8; 8]>::try_from(out.as_slice()).ok().map(u64::from_le_bytes);
+    Ok(Json(json!({ "output_hex": hex::encode(&out), "as_u64": as_u64 })))
+}
+
 async fn zones(State(e): State<Shared>) -> Json<Value> {
     Json(e.lock().unwrap().status_json()["zones"].clone())
 }
@@ -144,6 +184,10 @@ pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
         .route("/inbox/{chain}/{addr}", get(inbox))
         .route("/zones", get(zones))
         .route("/rewards/{addr}", get(rewards))
+        .route("/feistel/account/{addr}", get(feistel_account))
+        .route("/feistel/contract/{addr}", get(feistel_contract))
+        .route("/feistel/receipt/{txid}", get(feistel_receipt))
+        .route("/feistel/query/{addr}/{method}", post(feistel_query))
         .route("/tx", post(submit))
         .with_state(engine);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("rpc {addr}: {e}"))?;

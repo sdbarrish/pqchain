@@ -8,6 +8,7 @@
 
 use crate::codec::{DecodeResult, Reader, Wire, Writer};
 use crate::crypto::*;
+use crate::feistel::{Contract, FeistelState};
 use crate::ledger::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -154,6 +155,21 @@ pub fn encode(l: &Ledger, records: u64) -> Vec<u8> {
     }
     put_amounts(&mut w, &l.rewards);
     put_amounts(&mut w, &l.claim_nonces);
+    put_amounts(&mut w, &l.feistel.balances);
+    put_amounts(&mut w, &l.feistel.nonces);
+    w.u64(l.feistel.contracts.len() as u64);
+    for (a, c) in &l.feistel.contracts {
+        a.put(&mut w);
+        w.u32(c.code.len() as u32);
+        w.fixed(&c.code);
+        w.fixed(&c.code_hash);
+        c.creator.put(&mut w);
+        w.u64(c.storage.len() as u64);
+        for (k, v) in &c.storage {
+            w.bytes(k);
+            w.bytes(v);
+        }
+    }
     w.0
 }
 
@@ -195,6 +211,20 @@ pub fn decode(b: &[u8]) -> DecodeResult<(Ledger, u64)> {
     }
     l.rewards = get_amounts(&mut r)?;
     l.claim_nonces = get_amounts(&mut r)?;
+    let mut f = FeistelState { balances: get_amounts(&mut r)?, nonces: get_amounts(&mut r)?, ..Default::default() };
+    for _ in 0..count(&mut r)? {
+        let a = Address::get(&mut r)?;
+        let n = r.u32()? as usize;
+        let code: Vec<u8> = (0..n).map(|_| r.u8()).collect::<Result<_, _>>()?;
+        let code_hash = r.hash()?;
+        let creator = Address::get(&mut r)?;
+        let mut storage = BTreeMap::new();
+        for _ in 0..count(&mut r)? {
+            storage.insert(r.bytes()?, r.bytes()?);
+        }
+        f.contracts.insert(a, Contract { code, code_hash, creator, storage });
+    }
+    l.feistel = f;
     r.finish()?;
     Ok((l, records))
 }

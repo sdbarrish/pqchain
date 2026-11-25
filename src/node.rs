@@ -46,6 +46,7 @@ pub fn chain_from_str(s: &str) -> Result<ChainId, String> {
     match s.as_str() {
         "kerckhoffs" | "k" => Ok(ChainId::Kerckhoffs),
         "atbash" | "a" => Ok(ChainId::Atbash),
+        "feistel" | "f" => Ok(ChainId::Feistel),
         _ => s
             .strip_prefix("zone-")
             .or_else(|| s.strip_prefix("zone:"))
@@ -59,6 +60,7 @@ pub fn chain_slug(c: ChainId) -> String {
     match c {
         ChainId::Kerckhoffs => "kerckhoffs".into(),
         ChainId::Atbash => "atbash".into(),
+        ChainId::Feistel => "feistel".into(),
         ChainId::Zone(n) => format!("zone-{n}"),
     }
 }
@@ -926,6 +928,9 @@ impl Engine {
                 ChainId::Kerckhoffs => Body::Kerckhoffs(
                     picked.into_iter().filter_map(|t| if let Tx::Kerckhoffs(t) = t { Some(t) } else { None }).collect(),
                 ),
+                ChainId::Feistel => Body::Feistel(
+                    picked.into_iter().filter_map(|t| if let Tx::Feistel(t) = t { Some(t) } else { None }).collect(),
+                ),
                 _ => Body::Atbash(
                     picked.into_iter().filter_map(|t| if let Tx::Utxo(_, t) = t { Some(t) } else { None }).collect(),
                 ),
@@ -1089,6 +1094,8 @@ impl Engine {
             "peers": self.peers.keys().map(|a| a.to_text()).collect::<Vec<_>>(),
             "kerckhoffs": chain(ChainId::Kerckhoffs),
             "atbash": chain(ChainId::Atbash),
+            "feistel": chain(ChainId::Feistel),
+            "contracts": self.ledger.feistel.contracts.len(),
             "zones": zones,
             "mempool": self.mempool.len(),
             "state_root": hex::encode(self.ledger.state_root()),

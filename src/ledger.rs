@@ -8,6 +8,7 @@
 //!   finality certificate plus a Merkle inclusion proof.
 
 use crate::consensus::{FinalityCert, LightClient};
+use crate::feistel::{self, Action, FeistelState, FeistelTx, Receipt, BASE_FEE, FUEL_PER_FEE_UNIT, MAX_FUEL};
 use crate::crypto::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -39,6 +40,8 @@ static EMPTY_UTXOS: BTreeMap<OutPoint, TxOut> = BTreeMap::new();
 pub enum ChainId {
     Kerckhoffs,
     Atbash,
+    /// Smart-contract chain (WebAssembly, account-based).
+    Feistel,
     /// Application chain registered on the Kerckhoffs Chain.
     Zone(u32),
 }
@@ -49,13 +52,16 @@ impl ChainId {
         match self {
             ChainId::Kerckhoffs => 0,
             ChainId::Atbash => 1,
-            ChainId::Zone(n) => 2 + n as u64,
+            ChainId::Feistel => 2,
+            // Codes 3-15 are reserved for future primary chains (Hamming, Playfair).
+            ChainId::Zone(n) => 16 + n as u64,
         }
     }
     pub fn name(self) -> String {
         match self {
             ChainId::Kerckhoffs => "Kerckhoffs Chain".into(),
             ChainId::Atbash => "Atbash Chain".into(),
+            ChainId::Feistel => "Feistel Chain".into(),
             ChainId::Zone(n) => format!("Zone {n}"),
         }
     }
@@ -68,6 +74,7 @@ impl ChainId {
         match self {
             ChainId::Kerckhoffs => ctx::KERCKHOFFS_TX.to_vec(),
             ChainId::Atbash => ctx::ATBASH_TX.to_vec(),
+            ChainId::Feistel => ctx::FEISTEL_TX.to_vec(),
             ChainId::Zone(n) => format!("pqchain/v2/zone/{n}/tx").into_bytes(),
         }
     }
@@ -422,6 +429,7 @@ impl BlockHeader {
 pub enum Body {
     Atbash(Vec<AtbashTx>),
     Kerckhoffs(Vec<KerckhoffsTx>),
+    Feistel(Vec<FeistelTx>),
 }
 
 impl Body {
@@ -429,12 +437,14 @@ impl Body {
         match self {
             Body::Atbash(t) => t.iter().map(AtbashTx::id).collect(),
             Body::Kerckhoffs(t) => t.iter().map(KerckhoffsTx::id).collect(),
+            Body::Feistel(t) => t.iter().map(FeistelTx::id).collect(),
         }
     }
     pub fn len(&self) -> usize {
         match self {
             Body::Atbash(t) => t.len(),
             Body::Kerckhoffs(t) => t.len(),
+            Body::Feistel(t) => t.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -551,6 +561,9 @@ pub struct Ledger {
     pub claim_nonces: BTreeMap<Address, u64>,
     /// Total native tokens issued as rewards.
     pub minted: u64,
+    pub feistel: FeistelState,
+    /// Recent Feistel receipts by txid. Derived data, not part of the state root.
+    pub receipts: BTreeMap<Hash, Receipt>,
 }
 
 pub struct GenesisValidator {
@@ -581,7 +594,7 @@ impl Ledger {
                 },
             );
         }
-        for c in [ChainId::Kerckhoffs, ChainId::Atbash] {
+        for c in [ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel] {
             l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u64(c.code()).hash()));
             l.anchors.insert(c, 0);
         }
@@ -596,7 +609,7 @@ impl Ledger {
 
     /// Every chain this ledger tracks: the two primary chains plus zones.
     pub fn chains(&self) -> Vec<ChainId> {
-        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash];
+        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel];
         v.extend(self.zones.keys().map(|n| ChainId::Zone(*n)));
         v
     }
@@ -610,7 +623,7 @@ impl Ledger {
     pub fn chain_validators(&self, chain: ChainId, anchor: u64) -> Option<ValidatorSet> {
         let set = self.validators_at(anchor)?;
         match chain {
-            ChainId::Kerckhoffs | ChainId::Atbash => Some(set.clone()),
+            ChainId::Kerckhoffs | ChainId::Atbash | ChainId::Feistel => Some(set.clone()),
             ChainId::Zone(n) => {
                 let z = self.zones.get(&n)?;
                 if z.created_at > anchor {
@@ -666,6 +679,7 @@ impl Ledger {
             ChainId::Kerckhoffs => &self.kerckhoffs_utxos,
             ChainId::Atbash => &self.atbash_utxos,
             ChainId::Zone(n) => self.zone_utxos.get(&n).unwrap_or(&EMPTY_UTXOS),
+            ChainId::Feistel => &EMPTY_UTXOS, // account-based
         }
     }
     fn utxos_mut(&mut self, chain: ChainId) -> &mut BTreeMap<OutPoint, TxOut> {
@@ -673,6 +687,7 @@ impl Ledger {
             ChainId::Kerckhoffs => &mut self.kerckhoffs_utxos,
             ChainId::Atbash => &mut self.atbash_utxos,
             ChainId::Zone(n) => self.zone_utxos.entry(n).or_default(),
+            ChainId::Feistel => unreachable!("the Feistel Chain is account-based (apply_utxo rejects it)"),
         }
     }
 
@@ -793,6 +808,9 @@ impl Ledger {
                 ) {
                     return Err("zones exchange value with the Atbash Chain and other zones, not Kerckhoffs".into());
                 }
+                if dest == ChainId::Feistel && chain != ChainId::Atbash {
+                    return Err("the Feistel Chain is funded from the Atbash Chain only".into());
+                }
                 if !self.knows(dest) {
                     return Err("export to an unknown chain".into());
                 }
@@ -821,9 +839,86 @@ impl Ledger {
         self.apply_utxo(ChainId::Atbash, tx)
     }
 
+    /// Apply a Feistel (smart-contract) transaction. A valid transaction whose
+    /// execution fails is still included: its effects are rolled back, but it
+    /// consumes its nonce and pays for the fuel it used.
+    pub fn apply_feistel(&mut self, tx: &FeistelTx) -> Result<Receipt, String> {
+        let id = tx.id();
+        let sender = tx.sender();
+        if !tx.from.verify(ctx::FEISTEL_TX, &id, &tx.sig) {
+            return Err("invalid transaction signature".into());
+        }
+        if tx.nonce != self.feistel.nonce(&sender) {
+            return Err("bad nonce (stale or future)".into());
+        }
+        if tx.max_fuel > MAX_FUEL {
+            return Err(format!("max_fuel above the {MAX_FUEL} limit"));
+        }
+        let max_fee = tx.max_fee();
+        let receipt = if let Action::Import { outpoints } = &tx.action {
+            let unique: BTreeSet<_> = outpoints.iter().collect();
+            if outpoints.is_empty() || outpoints.len() > 256 || unique.len() != outpoints.len() {
+                return Err("import needs 1-256 distinct outpoints".into());
+            }
+            let mut total = 0u64;
+            for p in outpoints {
+                let o = self.atomic.get(&(ChainId::Feistel, *p)).ok_or("import: no such export")?;
+                if o.owner != sender || o.asset != NATIVE {
+                    return Err("import: export belongs to someone else or is not native".into());
+                }
+                total += o.amount;
+            }
+            if total < BASE_FEE {
+                return Err("import smaller than the fee".into());
+            }
+            for p in outpoints {
+                self.atomic.remove(&(ChainId::Feistel, *p));
+            }
+            self.feistel.credit_pub(sender, total);
+            *self.feistel.nonces.entry(sender).or_default() += 1;
+            Receipt { ok: true, ..Default::default() }
+        } else {
+            let value = match &tx.action {
+                Action::Transfer { amount, .. } | Action::Export { amount } => *amount,
+                Action::Call { value, .. } => *value,
+                _ => 0,
+            };
+            if self.feistel.balance(&sender) < max_fee.saturating_add(value) {
+                return Err("insufficient balance for value + max fee".into());
+            }
+            *self.feistel.nonces.entry(sender).or_default() += 1;
+            if let Action::Export { amount } = &tx.action {
+                self.feistel.debit_pub(&sender, *amount)?;
+                let op = OutPoint { txid: id, index: 0 };
+                self.atomic.insert((ChainId::Atbash, op), TxOut::native(sender, *amount));
+                Receipt { ok: true, ..Default::default() }
+            } else {
+                let mut scratch = self.feistel.clone();
+                match feistel::execute(&mut scratch, tx, sender) {
+                    Ok((output, logs, fuel_used, contract)) => {
+                        self.feistel = scratch;
+                        Receipt { ok: true, fuel_used, output, logs, contract, ..Default::default() }
+                    }
+                    Err((e, fuel_used)) => {
+                        Receipt { ok: false, fuel_used: fuel_used.min(tx.max_fuel), error: Some(e), ..Default::default() }
+                    }
+                }
+            }
+        };
+        let fee = BASE_FEE + receipt.fuel_used.div_ceil(FUEL_PER_FEE_UNIT);
+        self.feistel.debit_pub(&sender, fee)?;
+        self.burned += fee;
+        let receipt = Receipt { fee, ..receipt };
+        if self.receipts.len() >= 10_000 {
+            self.receipts.pop_first();
+        }
+        self.receipts.insert(id, receipt.clone());
+        Ok(receipt)
+    }
+
     /// Apply a UTXO transaction on the Atbash Chain or a zone.
     pub fn apply_utxo(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
-        if chain == ChainId::Kerckhoffs || !self.knows(chain) {
+        if matches!(chain, ChainId::Kerckhoffs | ChainId::Feistel) || !self.knows(chain) {
             return Err(format!("{} does not take UTXO transactions", chain.name()));
         }
         let id = tx.id();
@@ -1083,10 +1178,12 @@ impl Ledger {
             ChainId::Kerckhoffs if h.anchor != k_tip => {
                 return Err("Kerckhoffs block must anchor to its parent height".into())
             }
-            ChainId::Atbash | ChainId::Zone(_) if h.anchor > k_tip => {
+            ChainId::Atbash | ChainId::Feistel | ChainId::Zone(_) if h.anchor > k_tip => {
                 return Err("anchor is ahead of the local Kerckhoffs tip (retry later)".into())
             }
-            ChainId::Atbash | ChainId::Zone(_) if h.anchor < self.anchors.get(&h.chain).copied().unwrap_or(0) => {
+            ChainId::Atbash | ChainId::Feistel | ChainId::Zone(_)
+                if h.anchor < self.anchors.get(&h.chain).copied().unwrap_or(0) =>
+            {
                 return Err("anchor went backwards".into())
             }
             _ => {}
@@ -1126,6 +1223,11 @@ impl Ledger {
             (Body::Kerckhoffs(txs), ChainId::Kerckhoffs) => {
                 for (i, t) in txs.iter().enumerate() {
                     self.apply_kerckhoffs(t).map_err(|e| format!("tx {i}: {e}"))?;
+                }
+            }
+            (Body::Feistel(txs), ChainId::Feistel) => {
+                for (i, t) in txs.iter().enumerate() {
+                    self.apply_feistel(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
             _ => return Err("body does not match chain".into()),
@@ -1179,6 +1281,7 @@ impl Ledger {
             e.u64(c.code()).u64(*h).bytes(hash).u64(self.anchors.get(c).copied().unwrap_or(0));
         }
         e.u64(self.burned).u64(self.minted);
+        self.feistel.encode(&mut e);
         for (a, r) in &self.rewards {
             e.bytes(&a.0).u64(*r);
         }
@@ -1199,6 +1302,7 @@ pub fn propose_round(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64,
     let chain = match body {
         Body::Atbash(_) => ChainId::Atbash,
         Body::Kerckhoffs(_) => ChainId::Kerckhoffs,
+        Body::Feistel(_) => ChainId::Feistel,
     };
     propose_on(ledger, key, chain, body, timestamp, round)
 }

@@ -201,6 +201,25 @@ ok "only zone members proposed zone-0 blocks: $(grep -h 'proposing Zone 0' "$WOR
 FOLLOW=$(grep -h "accepted Zone 0" "$WORK"/full-0.log | head -1 | sed 's/.*via //; s/;.*//')
 ok "non-members follow zone-0 by finality certificate (full-0: '$FOLLOW')"
 
+say "Feistel smart contracts (WebAssembly, post-quantum accounts)"
+A0=$(height 8104 atbash)
+wallet export --key "$WORK/alice.key" --amount 30000 --from atbash --to feistel | sed 's/^/  /'
+wait_all atbash $((A0 + 1)) "${ALL[@]}"
+wallet feistel-import --key "$WORK/alice.key" | sed 's/^/  /'
+wait_all feistel 1 "${ALL[@]}"
+ok "alice moved 30000 from the Atbash Chain to her Feistel account: $(rpc 8104 "/feistel/account/$ALICE" | jget "d['balance']")"
+DEPLOY=$(wallet feistel-deploy --key "$WORK/alice.key" --code "$ROOT/contracts/counter.wat")
+echo "$DEPLOY" | sed 's/^/  /'
+COUNTER=$(echo "$DEPLOY" | awk '/contract address/ {print $3}')
+wait_all feistel 2 "${ALL[@]}"
+for i in 1 2 3; do
+  wallet feistel-call --key "$WORK/alice.key" --contract "$COUNTER" --method increment >/dev/null
+  wait_all feistel $((2 + i)) "${ALL[@]}"
+done
+COUNT=$("$BIN" wallet --rpc http://127.0.0.1:8104 feistel-query --contract "$COUNTER" --method get | jget "d['as_u64']")
+[ "$COUNT" = 3 ] || fail "counter should read 3, got $COUNT"
+ok "counter contract deployed and incremented 3 times; full node reads count = $COUNT"
+
 say "Staking rewards"
 W0=$(wallet show --key "$WORK/validator-0/withdrawal.key")
 MINTED=$(rpc 8104 /status | jget "d['minted']")

@@ -8,7 +8,7 @@ Each chain is named after a piece of cryptographic history:
 |---|---|---|
 | **Kerckhoffs Chain** | Staking, validator registry, delegation, slashing, governance | Kerckhoffs's principle (1883): security must rest only in the keys, just as the network's security rests in validator keys |
 | **Atbash Chain** | UTXO payments and user-created assets | Atbash, one of the oldest known ciphers, for the chain that carries the most basic use: moving value |
-| **Feistel Chain** *(planned)* | Smart contracts with post-quantum accounts | Feistel networks, which build complex ciphers from simple, composable rounds, as contracts compose |
+| **Feistel Chain** | WebAssembly smart contracts with post-quantum accounts | Feistel networks, which build complex ciphers from simple, composable rounds, as contracts compose |
 | **Hamming Chain** *(planned)* | Hash-based data availability for rollups | Hamming codes, the first error-correcting codes; data availability relies on erasure coding |
 | **Playfair Chain** *(planned)* | Bridges to other networks | The Playfair cipher, which works on pairs of letters, as a bridge links pairs of chains |
 | **Zones** | Application chains validated by a chosen subset of primary validators | |
@@ -27,6 +27,33 @@ Each chain is named after a piece of cryptographic history:
 | Consensus | Sampled Quorum Consensus: repeated stake-weighted random polls (k=20, alpha=14, beta=20). Deterministic stake-weighted leader schedule. |
 | Node tiers | Tier-1 validators, full node (replays everything, no stake), light client (checks >2/3-stake finality certificates) |
 | Safety | `#![forbid(unsafe_code)]`. Failed blocks leave state untouched. Non-malleable txids (signatures excluded). |
+
+## Feistel Chain (smart contracts)
+
+| Piece | Implementation |
+|---|---|
+| Accounts | Address of an ML-DSA-65 or SLH-DSA key; each transaction is signed and nonce-protected. |
+| Contracts | WebAssembly run by `wasmi` (deterministic interpreter) with fuel metering; floating point disabled. One exported function per method, optional `init` at deployment. |
+| Host API | `storage_read/write`, `caller`, `self_address`, `value`, `balance`, `input`, `output`, `log`, `transfer`. |
+| Fees | 1 + fuel used / 10,000, burned. A failed call is rolled back but pays for its fuel and uses its nonce. |
+| Funding | Export from the Atbash Chain to `feistel`, then `feistel-import`. `feistel-export` sends funds back. |
+| Examples | `contracts/counter.wat` and `contracts/tipjar.wat` (owner-only withdrawal). |
+
+```bash
+pqchain wallet export --key alice.key --amount 30000 --from atbash --to feistel
+pqchain wallet feistel-import --key alice.key
+pqchain wallet feistel-deploy --key alice.key --code contracts/counter.wat
+pqchain wallet feistel-call --key alice.key --contract <address> --method increment
+pqchain wallet feistel-query --contract <address> --method get
+```
+
+Not yet supported: contract-to-contract calls, contract upgrades, an EVM compatibility layer.
+
+## Staking rewards, discovery, snapshots
+
+- **Rewards:** each accepted block issues 1,000 native tokens, split across that chain's validators by stake. Delegators are paid pro rata minus a 10% commission. Claim with `wallet claim-rewards --key <withdrawal or reward key>` (replay-protected by a nonce).
+- **Peer discovery:** nodes announce their address and gossip known peers. A node needs one bootstrap peer; identities are pinned in the handshake.
+- **Snapshots:** every 20 log records the node writes a checksummed ledger snapshot. A restart loads it and re-executes only later records.
 
 ## Zones and relay messages (v2)
 
@@ -104,7 +131,7 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 ## Roadmap
 
 - **v1 (done, milestone 1)**: real P2P with hybrid post-quantum transport, consensus over the network, finality certificates, persistent storage, sync, RPC, wallet CLI, multi-process testnet
-- **v1 milestone 2**: Feistel Chain (smart contracts with PQ accounts), staking rewards and expiry, sentry nodes, peer discovery, state snapshots (no full replay), Docker images
+- **Core milestone 2 (done)**: staking rewards, peer discovery, state snapshots, Feistel smart-contract chain
 - **v2 step 1 (done)**: SLH-DSA (FIPS 205, hash-based) cold keys; validator exit authorized by the cold withdrawal key, with a 10-block unbonding period during which misbehaviour is still slashable
 - **v2 step 2 (done)**: zones (application chains validated by a subset of primary validators, registered on the Kerckhoffs Chain) and relay messages: cross-chain transfers proven by the source block's finality certificate plus a Merkle inclusion proof, claimable exactly once
 - **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys

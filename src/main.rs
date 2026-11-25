@@ -7,6 +7,7 @@ mod demo;
 use clap::{Parser, Subcommand};
 use pqchain::crypto::{Address, Keypair, PublicKey, ALG_ML_DSA_65};
 use pqchain::node::{self, chain_from_str, Allocation, Genesis, GenesisValidatorEntry, NodeConfig};
+use pqchain::feistel::Action;
 use pqchain::wallet::{self, Client};
 use std::path::{Path, PathBuf};
 
@@ -147,6 +148,58 @@ enum WalletCmd {
         #[arg(long)]
         key: PathBuf,
     },
+    /// Feistel Chain: claim funds exported from the Atbash Chain.
+    FeistelImport {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Feistel Chain: send funds back to your Atbash Chain address.
+    FeistelExport {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Feistel Chain: deploy a WebAssembly contract (.wasm or .wat).
+    FeistelDeploy {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        code: PathBuf,
+        #[arg(long, default_value_t = 5_000_000)]
+        fuel: u64,
+    },
+    /// Feistel Chain: call a contract method.
+    FeistelCall {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        contract: String,
+        #[arg(long)]
+        method: String,
+        /// Input as hex.
+        #[arg(long, default_value = "")]
+        input: String,
+        /// Native tokens to send with the call.
+        #[arg(long, default_value_t = 0)]
+        value: u64,
+        #[arg(long, default_value_t = 1_000_000)]
+        fuel: u64,
+    },
+    /// Feistel Chain: read-only contract call.
+    FeistelQuery {
+        #[arg(long)]
+        contract: String,
+        #[arg(long)]
+        method: String,
+        #[arg(long, default_value = "")]
+        input: String,
+    },
+    /// Feistel Chain: show a transaction's receipt.
+    FeistelReceipt {
+        #[arg(long)]
+        txid: String,
+    },
     /// Start a validator's exit (signed by its cold withdrawal key).
     Exit {
         /// Withdrawal key file of the validator.
@@ -282,6 +335,38 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
             println!("claiming {amount} in staking rewards");
             submit(&c, tx)?;
         }
+        WalletCmd::FeistelImport { key } => {
+            let k = node::load_key(&key)?;
+            let (tx, amount) = wallet::feistel_import(&c, &k)?;
+            println!("importing {amount} into the Feistel Chain");
+            submit(&c, tx)?;
+        }
+        WalletCmd::FeistelExport { key, amount } => {
+            let k = node::load_key(&key)?;
+            submit(&c, wallet::feistel(&c, &k, 0, Action::Export { amount })?)?;
+        }
+        WalletCmd::FeistelDeploy { key, code, fuel } => {
+            let k = node::load_key(&key)?;
+            let bytes = std::fs::read(&code).map_err(|e| format!("{}: {e}", code.display()))?;
+            let wasm = wat::parse_bytes(&bytes).map_err(|e| e.to_string())?.into_owned();
+            let tx = wallet::feistel(&c, &k, fuel, Action::Deploy { code: wasm })?;
+            if let pqchain::codec::Tx::Feistel(t) = &tx {
+                println!("contract address {}", pqchain::feistel::contract_address(&k.address(), t.nonce).to_text());
+            }
+            submit(&c, tx)?;
+        }
+        WalletCmd::FeistelCall { key, contract, method, input, value, fuel } => {
+            let k = node::load_key(&key)?;
+            let input = hex::decode(&input).map_err(|e| e.to_string())?;
+            let action = Action::Call { contract: Address::from_text(&contract)?, method, input, value };
+            submit(&c, wallet::feistel(&c, &k, fuel, action)?)?;
+        }
+        WalletCmd::FeistelQuery { contract, method, input } => {
+            let url = format!("{rpc}/feistel/query/{contract}/{method}");
+            let reply = ureq::post(&url).send_string(&input).map_err(|e| e.to_string())?;
+            println!("{}", reply.into_string().map_err(|e| e.to_string())?);
+        }
+        WalletCmd::FeistelReceipt { txid } => println!("{}", c.get(&format!("/feistel/receipt/{txid}"))?),
         WalletCmd::Exit { withdrawal_key, node } => {
             let k = node::load_key(&withdrawal_key)?;
             submit(&c, wallet::exit(Address::from_text(&node)?, &k))?;

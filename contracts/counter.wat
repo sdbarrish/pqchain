@@ -1,0 +1,18 @@
+;; Counter: `increment` adds 1 to a stored u64; `get` returns it (8 bytes, little-endian).
+(module
+  (import "env" "storage_read" (func $sread (param i32 i32 i32 i32) (result i32)))
+  (import "env" "storage_write" (func $swrite (param i32 i32 i32 i32)))
+  (import "env" "output" (func $output (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "count")
+  (func $load (result i64)
+    (if (result i64)
+      (i32.eq (call $sread (i32.const 0) (i32.const 5) (i32.const 64) (i32.const 8)) (i32.const 8))
+      (then (i64.load (i32.const 64)))
+      (else (i64.const 0))))
+  (func (export "increment")
+    (i64.store (i32.const 64) (i64.add (call $load) (i64.const 1)))
+    (call $swrite (i32.const 0) (i32.const 5) (i32.const 64) (i32.const 8)))
+  (func (export "get")
+    (i64.store (i32.const 64) (call $load))
+    (call $output (i32.const 64) (i32.const 8))))

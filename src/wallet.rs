@@ -74,6 +74,27 @@ fn wrap(chain: ChainId, base: Transfer, kind: KerckhoffsKind, n: usize, key: &Ke
     }
 }
 
+fn feistel_nonce(c: &Client, a: &Address) -> Result<u64, String> {
+    c.get(&format!("/feistel/account/{}", a.to_text()))?["nonce"].as_u64().ok_or("unexpected RPC reply".into())
+}
+
+/// Sign a Feistel action with the account's next nonce.
+pub fn feistel(c: &Client, key: &Keypair, max_fuel: u64, action: crate::feistel::Action) -> Result<Tx, String> {
+    let nonce = feistel_nonce(c, &key.address())?;
+    Ok(Tx::Feistel(crate::feistel::FeistelTx::new(key, nonce, max_fuel, action)))
+}
+
+/// Claim everything exported to this account on the Feistel Chain.
+pub fn feistel_import(c: &Client, key: &Keypair) -> Result<(Tx, u64), String> {
+    let pool = native_only(c.atomic(ChainId::Feistel, &key.address())?);
+    let total: u64 = pool.iter().map(|(_, o)| o.amount).sum();
+    if pool.is_empty() {
+        return Err("nothing exported to the Feistel Chain for this key".into());
+    }
+    let outpoints = pool.into_iter().map(|(p, _)| p).take(256).collect();
+    Ok((feistel(c, key, 0, crate::feistel::Action::Import { outpoints })?, total))
+}
+
 /// Claim accumulated staking rewards for this key's address.
 pub fn claim_rewards(c: &Client, key: &Keypair) -> Result<(Tx, u64), String> {
     let v = c.get(&format!("/rewards/{}", key.address().to_text()))?;

@@ -6,6 +6,7 @@
 
 use crate::consensus::FinalityCert;
 use crate::crypto::*;
+use crate::feistel::{Action, FeistelTx};
 use crate::ledger::*;
 
 pub const MAX_BYTES: usize = 1 << 20; // any single byte string
@@ -164,6 +165,7 @@ impl Wire for ChainId {
         match self {
             ChainId::Kerckhoffs => w.u8(0),
             ChainId::Atbash => w.u8(1),
+            ChainId::Feistel => w.u8(3),
             ChainId::Zone(n) => {
                 w.u8(2);
                 w.u32(*n);
@@ -175,6 +177,7 @@ impl Wire for ChainId {
             0 => Ok(ChainId::Kerckhoffs),
             1 => Ok(ChainId::Atbash),
             2 => Ok(ChainId::Zone(r.u32()?)),
+            3 => Ok(ChainId::Feistel),
             _ => Err("unknown chain id".into()),
         }
     }
@@ -452,6 +455,10 @@ impl Wire for Block {
     fn put(&self, w: &mut Writer) {
         self.signed.put(w);
         match &self.body {
+            Body::Feistel(t) => {
+                w.u8(2);
+                w.list(t);
+            }
             Body::Kerckhoffs(t) => {
                 w.u8(0);
                 w.list(t);
@@ -467,6 +474,7 @@ impl Wire for Block {
         let body = match r.u8()? {
             0 => Body::Kerckhoffs(r.list()?),
             1 => Body::Atbash(r.list()?),
+            2 => Body::Feistel(r.list()?),
             _ => return Err("unknown body".into()),
         };
         Ok(Block { signed, body })
@@ -500,11 +508,68 @@ impl Wire for FinalityCert {
     }
 }
 
+impl Wire for FeistelTx {
+    fn put(&self, w: &mut Writer) {
+        self.from.put(w);
+        w.u64(self.nonce);
+        w.u64(self.max_fuel);
+        match &self.action {
+            Action::Deploy { code } => {
+                w.u8(0);
+                w.bytes(code);
+            }
+            Action::Call { contract, method, input, value } => {
+                w.u8(1);
+                contract.put(w);
+                w.bytes(method.as_bytes());
+                w.bytes(input);
+                w.u64(*value);
+            }
+            Action::Transfer { to, amount } => {
+                w.u8(2);
+                to.put(w);
+                w.u64(*amount);
+            }
+            Action::Import { outpoints } => {
+                w.u8(3);
+                w.list(outpoints);
+            }
+            Action::Export { amount } => {
+                w.u8(4);
+                w.u64(*amount);
+            }
+        }
+        self.sig.put(w);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        let from = PublicKey::get(r)?;
+        let nonce = r.u64()?;
+        let max_fuel = r.u64()?;
+        let action = match r.u8()? {
+            0 => Action::Deploy { code: r.bytes()? },
+            1 => {
+                let contract = Address::get(r)?;
+                let method = String::from_utf8(r.bytes()?).map_err(|_| "method not UTF-8")?;
+                if method.len() > 64 {
+                    return Err("method name too long".into());
+                }
+                Action::Call { contract, method, input: r.bytes()?, value: r.u64()? }
+            }
+            2 => Action::Transfer { to: Address::get(r)?, amount: r.u64()? },
+            3 => Action::Import { outpoints: r.list()? },
+            4 => Action::Export { amount: r.u64()? },
+            _ => return Err("unknown Feistel action".into()),
+        };
+        Ok(FeistelTx { from, nonce, max_fuel, action, sig: Signature::get(r)? })
+    }
+}
+
 /// Any transaction, tagged by chain. `Utxo` covers the Atbash Chain and zones.
 #[derive(Clone, Debug)]
 pub enum Tx {
     Kerckhoffs(KerckhoffsTx),
     Utxo(ChainId, AtbashTx),
+    Feistel(FeistelTx),
 }
 
 impl Tx {
@@ -512,12 +577,14 @@ impl Tx {
         match self {
             Tx::Kerckhoffs(_) => ChainId::Kerckhoffs,
             Tx::Utxo(c, _) => *c,
+            Tx::Feistel(_) => ChainId::Feistel,
         }
     }
     pub fn id(&self) -> Hash {
         match self {
             Tx::Kerckhoffs(t) => t.id(),
             Tx::Utxo(_, t) => t.id(),
+            Tx::Feistel(t) => t.id(),
         }
     }
     /// Validate and apply to `l` (callers pass a clone to test).
@@ -525,6 +592,7 @@ impl Tx {
         match self {
             Tx::Kerckhoffs(t) => l.apply_kerckhoffs(t),
             Tx::Utxo(c, t) => l.apply_utxo(*c, t),
+            Tx::Feistel(t) => l.apply_feistel(t).map(|_| ()),
         }
     }
 }
@@ -541,12 +609,17 @@ impl Wire for Tx {
                 c.put(w);
                 t.put(w);
             }
+            Tx::Feistel(t) => {
+                w.u8(2);
+                t.put(w);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         match r.u8()? {
             0 => Ok(Tx::Kerckhoffs(KerckhoffsTx::get(r)?)),
             1 => Ok(Tx::Utxo(ChainId::get(r)?, AtbashTx::get(r)?)),
+            2 => Ok(Tx::Feistel(FeistelTx::get(r)?)),
             _ => Err("unknown tx chain".into()),
         }
     }

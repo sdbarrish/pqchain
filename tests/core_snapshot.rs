@@ -41,6 +41,14 @@ fn busy_ledger() -> Ledger {
     l.relay_consumed.insert((ChainId::Atbash, OutPoint { txid: [1; 32], index: 2 }));
     l.zone_utxos.entry(0).or_default().insert(OutPoint { txid: [2; 32], index: 0 }, TxOut::native(alice.address(), 3_999));
     l.claim_nonces.insert(alice.address(), 3);
+    l.feistel.balances.insert(alice.address(), 1_234);
+    l.feistel.nonces.insert(alice.address(), 9);
+    let mut storage = std::collections::BTreeMap::new();
+    storage.insert(b"count".to_vec(), 7u64.to_le_bytes().to_vec());
+    l.feistel.contracts.insert(
+        Address([5; 32]),
+        pqchain::feistel::Contract { code: vec![0, 97, 115, 109], code_hash: [6; 32], creator: alice.address(), storage },
+    );
     assert!(l.minted > 0 && !l.atomic.is_empty() && !l.zones.is_empty());
     l
 }
@@ -53,6 +61,7 @@ fn snapshot_roundtrip_preserves_state_root() {
     assert_eq!(back.state_root(), l.state_root());
     assert_eq!(back.validator_history.len(), l.validator_history.len());
     assert_eq!(back.tip(ChainId::Zone(0)), l.tip(ChainId::Zone(0)));
+    assert_eq!(back.feistel.contracts[&Address([5; 32])].storage.len(), 1);
 }
 
 #[test]

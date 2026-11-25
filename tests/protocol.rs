@@ -24,22 +24,22 @@ fn proposer<'a>(vals: &'a [Keypair], l: &Ledger, c: ChainId) -> &'a Keypair {
 #[test]
 fn ml_dsa_sign_verify_and_domain_separation() {
     let k = Keypair::generate();
-    let s = k.sign(ctx::X_TX, b"m");
-    assert!(k.public.verify(ctx::X_TX, b"m", &s));
-    assert!(!k.public.verify(ctx::P_TX, b"m", &s), "context must bind");
-    assert!(!k.public.verify(ctx::X_TX, b"n", &s));
+    let s = k.sign(ctx::PRISM_TX, b"m");
+    assert!(k.public.verify(ctx::PRISM_TX, b"m", &s));
+    assert!(!k.public.verify(ctx::KEYSTONE_TX, b"m", &s), "context must bind");
+    assert!(!k.public.verify(ctx::PRISM_TX, b"n", &s));
     assert_eq!((k.public.bytes.len(), s.bytes.len()), (VK_LEN, SIG_LEN));
 }
 
 #[test]
 fn double_spend_inside_one_block_rejected() {
     let (vals, a, b, l) = setup();
-    let (base, n) = native_transfer(&l, ChainId::X, Source::Local, &a, vec![TxOut::native(b.address(), 10)], None, 0).unwrap();
-    let t1 = XTx { base: base.clone(), create_asset: None }.sign(&vec![&a; n]);
+    let (base, n) = native_transfer(&l, ChainId::Prism, Source::Local, &a, vec![TxOut::native(b.address(), 10)], None, 0).unwrap();
+    let t1 = PrismTx { base: base.clone(), create_asset: None }.sign(&vec![&a; n]);
     let mut base2 = base;
     base2.outputs[0].amount = 11;
-    let t2 = XTx { base: base2, create_asset: None }.sign(&vec![&a; n]);
-    let blk = propose(&l, proposer(&vals, &l, ChainId::X), Body::X(vec![t1, t2]), 1);
+    let t2 = PrismTx { base: base2, create_asset: None }.sign(&vec![&a; n]);
+    let blk = propose(&l, proposer(&vals, &l, ChainId::Prism), Body::Prism(vec![t1, t2]), 1);
     let mut l2 = l.clone();
     assert!(l2.apply_block(&blk).unwrap_err().contains("double-spend"));
     assert_eq!(l2.state_root(), l.state_root(), "failed block must not change state");
@@ -48,7 +48,7 @@ fn double_spend_inside_one_block_rejected() {
 #[test]
 fn tampered_block_rejected() {
     let (vals, _, _, l) = setup();
-    let mut blk = propose(&l, proposer(&vals, &l, ChainId::X), Body::X(vec![]), 1);
+    let mut blk = propose(&l, proposer(&vals, &l, ChainId::Prism), Body::Prism(vec![]), 1);
     blk.signed.header.timestamp = 2;
     assert!(l.clone().apply_block(&blk).is_err());
 }
@@ -56,38 +56,38 @@ fn tampered_block_rejected() {
 #[test]
 fn equivocation_slashes_and_refunds_delegators() {
     let (vals, _, _, mut l) = setup();
-    let p = proposer(&vals, &l, ChainId::X);
+    let p = proposer(&vals, &l, ChainId::Prism);
     l.delegations.push(Delegation { node: p.address(), stake: 100, reward: vals[0].address() });
     l.validators.get_mut(&p.address()).unwrap().delegated = 100;
-    let a = propose(&l, p, Body::X(vec![]), 1);
-    let b = propose(&l, p, Body::X(vec![]), 2);
-    let tx = PTx { base: Transfer::default(), kind: PKind::Slash { a: Box::new(a.signed), b: Box::new(b.signed) } };
-    l.apply_p(&tx).unwrap();
+    let a = propose(&l, p, Body::Prism(vec![]), 1);
+    let b = propose(&l, p, Body::Prism(vec![]), 2);
+    let tx = KeystoneTx { base: Transfer::default(), kind: KeystoneKind::Slash { a: Box::new(a.signed), b: Box::new(b.signed) } };
+    l.apply_keystone(&tx).unwrap();
     assert!(l.validators[&p.address()].slashed);
-    assert_eq!(l.balance(ChainId::P, &vals[0].address(), &NATIVE), 100);
-    assert!(l.apply_p(&tx).is_err(), "cannot slash twice");
+    assert_eq!(l.balance(ChainId::Keystone, &vals[0].address(), &NATIVE), 100);
+    assert!(l.apply_keystone(&tx).is_err(), "cannot slash twice");
 }
 
 #[test]
 fn export_import_moves_value_exactly_once() {
     let (_, a, _, mut l) = setup();
-    let (base, n) = native_transfer(&l, ChainId::X, Source::Local, &a, vec![], Some((ChainId::P, vec![TxOut::native(a.address(), 500)])), 0).unwrap();
-    l.apply_x(&XTx { base, create_asset: None }.sign(&vec![&a; n])).unwrap();
-    let (base, n) = native_transfer(&l, ChainId::P, Source::Atomic, &a, vec![TxOut::native(a.address(), 499)], None, 0).unwrap();
-    let imp = PTx { base, kind: PKind::Transfer }.sign(&vec![&a; n]);
-    l.clone().apply_p(&imp).unwrap();
+    let (base, n) = native_transfer(&l, ChainId::Prism, Source::Local, &a, vec![], Some((ChainId::Keystone, vec![TxOut::native(a.address(), 500)])), 0).unwrap();
+    l.apply_prism(&PrismTx { base, create_asset: None }.sign(&vec![&a; n])).unwrap();
+    let (base, n) = native_transfer(&l, ChainId::Keystone, Source::Atomic, &a, vec![TxOut::native(a.address(), 499)], None, 0).unwrap();
+    let imp = KeystoneTx { base, kind: KeystoneKind::Transfer }.sign(&vec![&a; n]);
+    l.clone().apply_keystone(&imp).unwrap();
     let mut l2 = l.clone();
-    l2.apply_p(&imp).unwrap();
-    assert!(l2.apply_p(&imp).is_err(), "import replay must fail");
-    assert_eq!(l2.balance(ChainId::P, &a.address(), &NATIVE), 499);
+    l2.apply_keystone(&imp).unwrap();
+    assert!(l2.apply_keystone(&imp).is_err(), "import replay must fail");
+    assert_eq!(l2.balance(ChainId::Keystone, &a.address(), &NATIVE), 499);
 }
 
 #[test]
-fn snowball_is_safe_and_live_with_20pct_byzantine() {
+fn sampled_quorum_is_safe_and_live_with_20pct_byzantine() {
     for _ in 0..20 {
         let voters: Vec<Voter> =
             (0..10).map(|i| Voter { weight: 1, byzantine: i < 2, initial: Some(i % 2) }).collect();
-        let o = snowball(&voters, 2, Params::default());
+        let o = sampled_quorum(&voters, 2, Params::default());
         assert!(o.agreed().is_some(), "honest nodes must agree: {o:?}");
     }
 }
@@ -96,7 +96,7 @@ fn snowball_is_safe_and_live_with_20pct_byzantine() {
 fn light_client_rejects_minority_and_forged_votes() {
     let (vals, _, _, l) = setup();
     let lc = LightClient::from_ledger(&l);
-    let mut c = FinalityCert::new(ChainId::X, 1, [1; 32]);
+    let mut c = FinalityCert::new(ChainId::Prism, 1, [1; 32]);
     for v in &vals[..3] {
         c.add_vote(v);
     }

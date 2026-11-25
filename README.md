@@ -107,7 +107,8 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 - **v1 milestone 2**: Feistel Chain (smart contracts with PQ accounts), staking rewards and expiry, sentry nodes, peer discovery, state snapshots (no full replay), Docker images
 - **v2 step 1 (done)**: SLH-DSA (FIPS 205, hash-based) cold keys; validator exit authorized by the cold withdrawal key, with a 10-block unbonding period during which misbehaviour is still slashable
 - **v2 step 2 (done)**: zones (application chains validated by a subset of primary validators, registered on the Kerckhoffs Chain) and relay messages: cross-chain transfers proven by the source block's finality certificate plus a Merkle inclusion proof, claimable exactly once
-- **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
+- **v2 STARK spike (done, research)**: see [`research/stark-agg`](research/stark-agg/README.md). A hash-based STARK proves ">2/3 of N validators signed" in ~100 KB with 3 ms verification at any N; 22× smaller than ML-DSA certificates at 1,023 validators, break-even near 32. Proving is slow (43 s / 8 GB at 1,023), so it suits light clients and relay proofs, not consensus.
+- **v2 remaining**: production STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
 - **v3**: Hamming Chain (hash-based data availability), Playfair Chain bridges, fuzzing, formal verification (Kani/Verus), external audits
 
 ## Credits

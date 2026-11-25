@@ -1,0 +1,20 @@
+[package]
+name = "stark-agg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Research spike: STARK-aggregated hash-based signatures for PQ-Chain finality certificates"
+
+[dependencies]
+winterfell = { version = "=0.13.1" }
+blake3 = { version = "1.8", default-features = false }
+core-utils = { version = "0.13", package = "winter-utils" }
+rand-utils = { version = "0.13", package = "winter-rand-utils" }
+tracing = "0.1"
+
+[features]
+default = ["concurrent"]
+concurrent = ["winterfell/concurrent"]
+
+[profile.release]
+codegen-units = 1

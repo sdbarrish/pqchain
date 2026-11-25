@@ -2,7 +2,7 @@
 //! ledger replica, plus wallet helpers. (v0 simulates the network in one
 //! process; v1 replaces this with real P2P over ML-KEM-768 + X25519.)
 
-use crate::consensus::{snowball, FinalityCert, LightClient, Params, Voter};
+use crate::consensus::{sampled_quorum, FinalityCert, LightClient, Params, Voter};
 use crate::crypto::*;
 use crate::ledger::*;
 
@@ -98,7 +98,7 @@ impl Network {
             return Err("no valid candidate block".into());
         }
 
-        let out = snowball(&voters, candidates.len(), self.params);
+        let out = sampled_quorum(&voters, candidates.len(), self.params);
         let winner = out.agreed().ok_or("consensus did not converge")?;
         let block = &candidates[winner];
 

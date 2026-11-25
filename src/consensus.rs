@@ -1,6 +1,6 @@
-//! Snowman-style consensus (Avalanche Snowball family) + finality certificates.
+//! Sampled Quorum Consensus (repeated random-subsample voting) + finality certificates.
 //!
-//! Snowball needs no signature certificates to *reach* agreement: each node
+//! Sampled quorum voting needs no signature certificates to *reach* agreement: each node
 //! repeatedly polls `k` stake-weighted random validators. That makes it a good
 //! fit for large post-quantum signatures. Signatures are only gathered once,
 //! after acceptance, into a finality certificate that light clients check.
@@ -23,7 +23,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        // Same shape as Avalanche mainnet (k=20, alpha≈14-15, beta=20).
+        // k=20, alpha=14, beta=20: parameters from the published metastable-consensus research.
         Params { k: 20, alpha: 14, beta: 20, max_rounds: 5_000 }
     }
 }
@@ -57,7 +57,7 @@ impl Outcome {
     }
 }
 
-struct Snowball {
+struct QuorumState {
     pref: usize,
     counts: Vec<u64>,
     last: Option<usize>,
@@ -65,10 +65,10 @@ struct Snowball {
     decided: Option<usize>,
 }
 
-/// Run Snowball over `n_candidates` conflicting blocks for one height.
+/// Run sampled quorum voting over `n_candidates` conflicting blocks for one height.
 /// Byzantine voters always answer with whatever honest nodes currently
 /// prefer least, trying to keep the network split.
-pub fn snowball(voters: &[Voter], n_candidates: usize, p: Params) -> Outcome {
+pub fn sampled_quorum(voters: &[Voter], n_candidates: usize, p: Params) -> Outcome {
     let mut rng = rand::rng();
     let total: u64 = voters.iter().map(|v| v.weight).sum();
     let mut cum = Vec::with_capacity(voters.len());
@@ -78,10 +78,10 @@ pub fn snowball(voters: &[Voter], n_candidates: usize, p: Params) -> Outcome {
         cum.push(acc);
     }
 
-    let mut st: Vec<Option<Snowball>> = voters
+    let mut st: Vec<Option<QuorumState>> = voters
         .iter()
         .map(|v| {
-            (!v.byzantine).then(|| Snowball {
+            (!v.byzantine).then(|| QuorumState {
                 pref: v.initial.unwrap_or(0),
                 counts: vec![0; n_candidates],
                 last: None,

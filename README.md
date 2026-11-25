@@ -55,6 +55,28 @@ Not yet supported: contract-to-contract calls, contract upgrades, an EVM compati
 - **Peer discovery:** nodes announce their address and gossip known peers. A node needs one bootstrap peer; identities are pinned in the handshake.
 - **Snapshots:** every 20 log records the node writes a checksummed ledger snapshot. A restart loads it and re-executes only later records.
 
+## Hardening (v3)
+
+**Fuzzing** (`cargo +nightly fuzz run <target>` in `fuzz/`, libFuzzer):
+
+| Target | What must hold | Inputs tried |
+|---|---|---|
+| `decode` | Every wire decoder (messages, blocks, transactions, relay proofs, certificates) rejects garbage without panicking; anything accepted re-encodes to the exact input | ~16 million |
+| `snapshot` | Same for snapshots | ~13 million |
+| `supply` | Arbitrary sequences of correctly signed operations conserve money: held + burned = genesis + minted after every step | ~63,000 sequences |
+| `wasm` | Generated WebAssembly contracts never panic the node, stay within fuel, and run deterministically | ~24,000 contracts |
+
+Bugs found and fixed (crash inputs kept in `fuzz/regressions/`):
+1. **Non-atomic transactions** (`supply`): a transaction rejected late in validation, such as a delegation over the cap, left inputs spent and fees burned in the scratch state the mempool and proposer use. Every `apply_*` is now all-or-nothing.
+2. **Non-canonical snapshots** (`snapshot`): the decoder accepted out-of-order or duplicate keys. Keys must now strictly increase.
+
+**Formal proofs** (`cargo kani`, bounded model checking, every input):
+- the wire reader never panics or reads out of bounds
+- chain codes are unique for every possible zone number
+- fees never overflow, and a transaction never pays more than its declared maximum
+
+Reward arithmetic is not formally proved: the solver could not finish symbolic 128-bit division even at 8-bit inputs. It is covered by a unit test sampling 200,000 cases over the full 64-bit range and by the `supply` fuzzer.
+
 ## Zones and relay messages (v2)
 
 | Piece | Implementation |
@@ -135,7 +157,8 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 - **v2 step 1 (done)**: SLH-DSA (FIPS 205, hash-based) cold keys; validator exit authorized by the cold withdrawal key, with a 10-block unbonding period during which misbehaviour is still slashable
 - **v2 step 2 (done)**: zones (application chains validated by a subset of primary validators, registered on the Kerckhoffs Chain) and relay messages: cross-chain transfers proven by the source block's finality certificate plus a Merkle inclusion proof, claimable exactly once
 - **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
-- **v3**: Hamming Chain (hash-based data availability), Playfair Chain bridges, fuzzing, formal verification (Kani/Verus), external audits
+- **v3 hardening (done)**: fuzzing (4 targets, 2 bugs fixed), Kani proofs, atomic transaction application
+- **v3 remaining**: Hamming Chain (hash-based data availability), Playfair Chain bridges, external audits
 
 ## Credits
 

@@ -1383,3 +1383,27 @@ pub fn propose_on(ledger: &Ledger, key: &Keypair, chain: ChainId, body: Body, ti
     let sig = key.sign(ctx::BLOCK, &header.hash());
     Block { signed: SignedHeader { header, sig }, body }
 }
+
+#[cfg(test)]
+mod reward_math_tests {
+    use super::*;
+
+    /// Complements the bounded Kani proofs: random values over the full u64 range.
+    #[test]
+    fn reward_math_never_pays_more_than_issued_full_range() {
+        for i in 0..200_000u64 {
+            let r = |k: u64| -> u64 {
+                let h = crate::crypto::Enc::new("t").u64(i).u64(k).hash();
+                let v = u64::from_le_bytes(h[..8].try_into().unwrap());
+                v >> (h[8] % 64) // mix of magnitudes, including huge ones
+            };
+            let w = [r(0), r(1), r(2)];
+            let shares = reward_shares(&w);
+            assert!(shares.iter().sum::<u128>() <= BLOCK_REWARD as u128);
+            let (stake, delegated) = (r(3), r(4));
+            let weight = stake.saturating_add(delegated);
+            let (mine, parts) = split_validator_reward(shares[0], stake.min(weight), weight, &[r(5), r(6)]);
+            assert!(mine + parts.iter().sum::<u128>() <= shares[0]);
+        }
+    }
+}

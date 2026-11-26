@@ -98,6 +98,13 @@ scripts/bridge-testnet.sh                                           # two live n
 
 Not supported yet: bridges to non-PQ-Chain networks (Bitcoin, Ethereum), skipping light-client updates (every Kerckhoffs header is applied in order), and token types other than each network's native token.
 
+## Audit preparation
+
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md): the protocol rules, with the code location enforcing each
+- [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md): assets, adversaries, trust assumptions, mitigations
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md): known weaknesses with self-assessed severity
+- [`docs/AUDIT_GUIDE.md`](docs/AUDIT_GUIDE.md): code map, how to reproduce every check, suggested review order
+
 ## Hardening (v3)
 
 **Fuzzing** (`cargo +nightly fuzz run <target>` in `fuzz/`, libFuzzer):

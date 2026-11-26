@@ -138,3 +138,19 @@ fn export_returns_funds_to_atbash() {
     let base = Transfer::spend(&spends, vec![TxOut::native(n.alice.address(), 6_999)]);
     n.l.apply_atbash(&AtbashTx { base, create_asset: None }.sign(&vec![&n.alice; spends.len()])).unwrap();
 }
+
+/// Regression: a contract cannot make nodes allocate unbounded memory.
+#[test]
+fn memory_growth_is_capped() {
+    let mut n = net();
+    let hog = wat::parse_str(r#"(module (memory (export "memory") 1)
+        (func (export "hog") (drop (memory.grow (i32.const 60000)))))"#).unwrap();
+    let c = n.send(true, 5_000_000, Action::Deploy { code: hog }).unwrap().contract.unwrap();
+    let r = n.send(true, 1_000_000, Action::Call { contract: c, method: "hog".into(), input: vec![], value: 0 }).unwrap();
+    assert!(!r.ok, "growing to ~3.7 GiB must fail");
+    // A module asking for 64 MiB of initial memory cannot be instantiated.
+    let big = wat::parse_str(r#"(module (memory (export "memory") 1024) (func (export "f")))"#).unwrap();
+    let c = n.send(true, 5_000_000, Action::Deploy { code: big }).unwrap().contract.unwrap();
+    let r = n.send(true, 1_000_000, Action::Call { contract: c, method: "f".into(), input: vec![], value: 0 }).unwrap();
+    assert!(!r.ok && r.error.unwrap_or_default().contains("instantiation"));
+}

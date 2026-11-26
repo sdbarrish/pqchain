@@ -20,7 +20,7 @@
 
 use crate::crypto::*;
 use std::collections::BTreeMap;
-use wasmi::{Caller, Config, Engine, Extern, Linker, Module, Store};
+use wasmi::{Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 pub const BASE_FEE: u64 = 1;
 pub const FUEL_PER_FEE_UNIT: u64 = 10_000;
@@ -34,6 +34,10 @@ const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 16 * 1024;
 const MAX_IO: usize = 64 * 1024;
 const MAX_LOGS: usize = 64;
+/// Linear memory a contract may use (initial + grown). Without a cap a
+/// contract could make every node allocate up to 4 GiB.
+pub const MAX_MEMORY: usize = 16 * 1024 * 1024;
+const MAX_TABLE_ELEMENTS: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct Contract {
@@ -181,6 +185,7 @@ struct Host {
     logs: Vec<Vec<u8>>,
     storage: BTreeMap<Vec<u8>, Vec<u8>>,
     transfers: Vec<(Address, u64)>,
+    limits: StoreLimits,
 }
 
 type HostResult<T> = Result<T, wasmi::Error>;
@@ -310,8 +315,17 @@ fn run(
         logs: Vec::new(),
         storage: c.storage.clone(),
         transfers: Vec::new(),
+        limits: StoreLimitsBuilder::new()
+            .memory_size(MAX_MEMORY)
+            .memories(1)
+            .tables(1)
+            .table_elements(MAX_TABLE_ELEMENTS)
+            .instances(1)
+            .trap_on_grow_failure(true)
+            .build(),
     };
     let mut store = Store::new(&engine, host);
+    store.limiter(|h| &mut h.limits);
     store.set_fuel(fuel).map_err(|e| (e.to_string(), 0))?;
     let used = |s: &Store<Host>| fuel - s.get_fuel().unwrap_or(0);
     let linker = linker(&engine).map_err(|e| (e, 0))?;

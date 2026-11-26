@@ -1,0 +1,76 @@
+# Known issues and limitations
+
+Self-assessed by the development team before any external audit. Severities are our estimates for a
+mainnet deployment holding real value: **High** = could lose funds or break safety, **Medium** = could
+halt the network or degrade guarantees, **Low** = hardening or hygiene. None of these has been reviewed
+by a third party.
+
+## Consensus
+
+| # | Issue | Severity |
+|---|---|---|
+| C1 | **Testnet consensus parameters.** `alpha = 12` of `k = 20` trades safety margin for liveness with 4–6 validators. Mainnet needs a higher `alpha` (e.g. 15–16) and analysis of the resulting safety/liveness bounds. | High |
+| C2 | **Votes in polls (chits) are unsigned.** A validator can answer polls inconsistently with no evidence left behind. Only proposer equivocation is slashable; vote equivocation in certificates is not. | Medium |
+| C3 | **Anchor staleness.** Non-Kerckhoffs blocks may use any anchor between the previous one and the local Kerckhoffs tip. A proposer can keep using an old anchor, delaying the effect of validator-set changes; an *exiting* (not slashed) validator remains schedulable under old anchors. | Medium |
+| C4 | **Predictable leader schedule.** Anyone can compute upcoming proposers and target them with DoS. Rounds keep the chain live but slower. | Low |
+| C5 | **No long-range attack protection.** There is no weak-subjectivity checkpointing; a node syncing from scratch trusts the certificates of historical validator sets, whose keys may later be compromised. | Medium |
+| C6 | **Block timestamps are not validated.** They are informational only; nothing should depend on them. | Low |
+
+## Denial of service
+
+| # | Issue | Severity |
+|---|---|---|
+| D1 | **No per-peer rate limits.** A peer can flood transactions, blocks, votes or queries; each vote costs an ML-DSA verification. | Medium |
+| D2 | **Handshake cost.** Each inbound connection costs ML-KEM encapsulation and ML-DSA signing/verification before authentication completes. No connection rate limits. | Medium |
+| D3 | **RPC is unauthenticated and unlimited.** `POST /feistel/query` runs a contract with up to 50M fuel per request; `/bridge/outbox` and `/inbox` scan all blocks. Expose RPC only on trusted interfaces. | Medium |
+| D4 | **O(state) per transaction.** Atomic transaction application clones the ledger for each transaction (mempool, proposer, RPC submission). Throughput degrades as state grows. | Medium |
+| D5 | **Discovery poisoning.** Peers can fill the 1,000-entry known-peer table with bogus addresses (dial attempts are bounded but there is no scoring or eviction). Eclipse resistance is not designed in. | Medium |
+| D6 | **Low fees.** Fees are flat and tiny (no fee market or congestion pricing); spam is cheap. | Medium |
+
+## Cross-chain and bridges
+
+| # | Issue | Severity |
+|---|---|---|
+| B1 | **Registration is a trust anchor.** The first tracked validator set is accepted as given (paid by a fee, not verified). A malicious registration can create a fake counterparty under a real network's id. Users must check the network id and registration out of band; governance-controlled registration is not implemented. | High |
+| B2 | **No update skipping.** Light clients must apply every Kerckhoffs header in order. A counterparty with many Kerckhoffs blocks is expensive to follow. | Low |
+| B3 | **Set pruning.** Only the newest 256 tracked sets are kept; a proof anchored before the oldest kept set cannot be delivered. | Low |
+| B4 | **Zones' safety equals their members' honesty.** A zone with few members can be taken over cheaply; relay messages from it are then forgeable. The Atbash Chain accepts relay messages from any zone. | Medium |
+| B5 | **Hamming light clients take the validator set from one node** (`/validators`) instead of following Kerckhoffs certificates from genesis. | Medium |
+| B6 | **No data-availability fraud proofs.** Correct encoding relies on validators re-encoding; nodes that only sample cannot prove a bad encoding. | Medium |
+| B7 | **Blobs are never pruned.** Storage grows without bound. | Low |
+| B8 | **Merkle proofs do not bind the leaf count.** With odd-sized levels a valid path can also verify at a "phantom" index. Callers bind indices separately (shard leaves include the index; consumption is keyed by message identity), but new uses must do the same. | Low |
+
+## Execution (Feistel)
+
+| # | Issue | Severity |
+|---|---|---|
+| F1 | **Fuel prices are not calibrated.** Host-call and storage costs are rough estimates; some operations may be under-priced relative to their real CPU and memory cost. | Medium |
+| F2 | **Each call recompiles the module.** Compilation cost is not charged as fuel beyond the deployment fee. | Medium |
+| F3 | **State is cloned per transaction** (see D4). | Medium |
+| F4 | **No cross-contract calls, upgrades or contract destruction.** Feature gaps rather than bugs. | Low |
+
+## Economics
+
+| # | Issue | Severity |
+|---|---|---|
+| E1 | **Unbounded issuance.** 1,000 tokens per block on every chain with no cap or decay; issuance scales with block count, so transaction spam increases inflation. | Medium |
+| E2 | **No uptime requirement.** Offline validators keep earning rewards. | Medium |
+| E3 | **Rewards are not formally verified.** Kani could not finish the 128-bit arithmetic; covered by a 200,000-case full-range test and the supply fuzzer instead. | Low |
+
+## Keys and operations
+
+| # | Issue | Severity |
+|---|---|---|
+| K1 | **Keys are plaintext seed files** (mode 0600). No HSM, encryption at rest, or key ceremony tooling. | High (for mainnet) |
+| K2 | **Block keys cannot be rotated** without exiting and re-registering the validator. | Low |
+| K3 | **Randomness** for keys and hedged signing comes from `rand`'s OS-seeded CSPRNG; production should use a vetted hardware source. | Low |
+| K4 | **Research code.** `research/stark-agg` (on branch `v2-stark-spike`) uses example-grade parameters and is not part of the node. | Info |
+
+## Fixed during development (for the record)
+
+| Issue | Found by | Fix |
+|---|---|---|
+| Rejected transactions left partial state changes in the mempool/proposer scratch state | `supply` fuzzer | All transaction application is atomic; regression test |
+| Snapshot decoder accepted non-canonical encodings | `snapshot` fuzzer | Strictly increasing keys required |
+| Contracts could grow memory toward 4 GiB | review during audit preparation | 16 MiB memory cap and instance limits; regression test |
+| Validator weight could overflow on extreme values | Kani review | Saturating addition |

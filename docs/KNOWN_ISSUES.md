@@ -61,7 +61,7 @@ by a third party.
 
 | # | Issue | Severity |
 |---|---|---|
-| K1 | **Keys are plaintext seed files** (mode 0600). No HSM, encryption at rest, or key ceremony tooling. | High (for mainnet) |
+| K1 | ~~Keys stored as plaintext seed files~~ **Partly fixed.** Key files are now encrypted at rest (Argon2id, 64 MiB, 3 passes → ChaCha20-Poly1305, address bound as associated data) when `PQCHAIN_PASSPHRASE` is set; `wallet encrypt-key` converts old files; plaintext files still load with a warning. Remaining: the passphrase comes from an environment variable, keys are decrypted into process memory, and there is no HSM or key-ceremony tooling. | ~~High~~ Medium |
 | K2 | **Block keys cannot be rotated** without exiting and re-registering the validator. | Low |
 | K3 | **Randomness** for keys and hedged signing comes from `rand`'s OS-seeded CSPRNG; production should use a vetted hardware source. | Low |
 | K4 | **Research code.** `research/stark-agg` (on branch `v2-stark-spike`) uses example-grade parameters and is not part of the node. | Info |

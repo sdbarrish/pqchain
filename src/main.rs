@@ -64,6 +64,11 @@ enum WalletCmd {
         #[arg(long)]
         cold: bool,
     },
+    /// Encrypt an existing plaintext key file in place (passphrase from PQCHAIN_PASSPHRASE).
+    EncryptKey {
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Show a key file's address.
     Show {
         #[arg(long)]
@@ -509,6 +514,16 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
         WalletCmd::Exit { withdrawal_key, node } => {
             let k = node::load_key(&withdrawal_key)?;
             submit(&c, wallet::exit(Address::from_text(&node)?, &k))?;
+        }
+        WalletCmd::EncryptKey { key } => {
+            let pass = std::env::var(node::PASSPHRASE_ENV).ok().filter(|p| !p.is_empty())
+                .ok_or(format!("set {} to the new passphrase", node::PASSPHRASE_ENV))?;
+            if node::key_is_encrypted(&key)? {
+                return Err("key file is already encrypted".into());
+            }
+            let k = node::load_key_with(&key, None)?;
+            node::save_key_with(&key, &k, Some(&pass), true)?;
+            println!("{} encrypted (Argon2id + ChaCha20-Poly1305)", key.display());
         }
         WalletCmd::Show { key } => println!("{}", node::load_key(&key)?.address().to_text()),
         WalletCmd::Balance { key, address } => {

@@ -122,18 +122,107 @@ pub struct KeyFile {
     pub algorithm: String,
     pub address: String,
     pub public_key: String,
-    /// Secret: the 32-byte ML-DSA-65 seed.
-    pub seed: String,
+    /// Plaintext seed (legacy / unencrypted files only). Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
+    /// Passphrase-encrypted seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<EncryptedSeed>,
 }
 
+/// Seed encrypted at rest: Argon2id (memory-hard) derives a key from the
+/// passphrase; ChaCha20-Poly1305 encrypts the seed with the address as
+/// associated data (so a ciphertext cannot be moved to another file).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct EncryptedSeed {
+    pub kdf: String,
+    pub m_cost_kib: u32,
+    pub t_cost: u32,
+    pub p_cost: u32,
+    pub salt: String,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+/// Environment variable holding the key-file passphrase.
+pub const PASSPHRASE_ENV: &str = "PQCHAIN_PASSPHRASE";
+const KDF_M_COST_KIB: u32 = 64 * 1024;
+const KDF_T_COST: u32 = 3;
+
+fn kdf(pass: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32], String> {
+    let params = argon2::Params::new(m, t, p, Some(32)).map_err(|e| e.to_string())?;
+    let mut out = [0u8; 32];
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(pass.as_bytes(), salt, &mut out)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+pub fn encrypt_seed(seed: &[u8; 32], address: &str, pass: &str) -> Result<EncryptedSeed, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    let (mut salt, mut nonce) = ([0u8; 16], [0u8; 12]);
+    rand::fill(&mut salt);
+    rand::fill(&mut nonce);
+    let mut key = kdf(pass, &salt, KDF_M_COST_KIB, KDF_T_COST, 1)?;
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
+    key.fill(0);
+    let ct = cipher
+        .encrypt(chacha20poly1305::Nonce::from_slice(&nonce), Payload { msg: seed, aad: address.as_bytes() })
+        .map_err(|_| "encryption failed")?;
+    Ok(EncryptedSeed {
+        kdf: "argon2id".into(),
+        m_cost_kib: KDF_M_COST_KIB,
+        t_cost: KDF_T_COST,
+        p_cost: 1,
+        salt: hex::encode(salt),
+        nonce: hex::encode(nonce),
+        ciphertext: hex::encode(ct),
+    })
+}
+
+pub fn decrypt_seed(e: &EncryptedSeed, address: &str, pass: &str) -> Result<[u8; 32], String> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    // Bound the KDF cost a (possibly hostile) file can demand.
+    if e.kdf != "argon2id" || e.m_cost_kib > 1024 * 1024 || e.t_cost > 10 || e.p_cost > 8 {
+        return Err("unsupported or excessive key-file KDF parameters".into());
+    }
+    let salt = hex::decode(&e.salt).map_err(|e| e.to_string())?;
+    let nonce = hex::decode(&e.nonce).map_err(|e| e.to_string())?;
+    if nonce.len() != 12 || salt.len() < 8 {
+        return Err("malformed encrypted key".into());
+    }
+    let mut key = kdf(pass, &salt, e.m_cost_kib, e.t_cost, e.p_cost)?;
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
+    key.fill(0);
+    let ct = hex::decode(&e.ciphertext).map_err(|e| e.to_string())?;
+    let pt = cipher
+        .decrypt(chacha20poly1305::Nonce::from_slice(&nonce), Payload { msg: &ct, aad: address.as_bytes() })
+        .map_err(|_| "wrong passphrase or corrupted key file")?;
+    pt.try_into().map_err(|_| "decrypted seed has the wrong length".into())
+}
+
+fn env_passphrase() -> Option<String> {
+    std::env::var(PASSPHRASE_ENV).ok().filter(|p| !p.is_empty())
+}
+
+/// Save a key; encrypted if `PQCHAIN_PASSPHRASE` is set, plaintext otherwise.
 pub fn save_key(path: &Path, k: &Keypair) -> Result<(), String> {
-    let f = KeyFile {
-        algorithm: alg_name(k.alg()).into(),
-        address: k.address().to_text(),
-        public_key: hex::encode(&k.public.bytes),
-        seed: hex::encode(k.seed()),
+    save_key_with(path, k, env_passphrase().as_deref(), false)
+}
+
+/// Save a key with an explicit passphrase (None = plaintext). `replace`
+/// overwrites an existing file atomically.
+pub fn save_key_with(path: &Path, k: &Keypair, pass: Option<&str>, replace: bool) -> Result<(), String> {
+    let address = k.address().to_text();
+    let (seed, encrypted) = match pass {
+        Some(p) => (None, Some(encrypt_seed(&k.seed(), &address, p)?)),
+        None => (Some(hex::encode(k.seed())), None),
     };
+    let f = KeyFile { algorithm: alg_name(k.alg()).into(), address, public_key: hex::encode(&k.public.bytes), seed, encrypted };
     let json = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
+    let target = path.to_path_buf();
+    let path = if replace { path.with_extension("tmp") } else { path.to_path_buf() };
+    let path = path.as_path();
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -142,16 +231,40 @@ pub fn save_key(path: &Path, k: &Keypair) -> Result<(), String> {
         opts.mode(0o600);
     }
     let mut file = opts.open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    file.write_all(json.as_bytes()).map_err(|e| e.to_string())
+    file.write_all(json.as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    if replace {
+        std::fs::rename(path, &target).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
+/// Load a key; encrypted files need `PQCHAIN_PASSPHRASE`.
 pub fn load_key(path: &Path) -> Result<Keypair, String> {
+    load_key_with(path, env_passphrase().as_deref())
+}
+
+/// Whether a key file is encrypted at rest.
+pub fn key_is_encrypted(path: &Path) -> Result<bool, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let f: KeyFile = serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
-    let seed: [u8; 32] = hex::decode(&f.seed)
-        .map_err(|e| e.to_string())?
-        .try_into()
-        .map_err(|_| "seed must be 32 bytes")?;
+    Ok(f.encrypted.is_some())
+}
+
+pub fn load_key_with(path: &Path, pass: Option<&str>) -> Result<Keypair, String> {
+    let s = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let f: KeyFile = serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+    let seed: [u8; 32] = match (&f.encrypted, &f.seed) {
+        (Some(e), _) => {
+            let p = pass.ok_or(format!("{}: encrypted key; set {PASSPHRASE_ENV}", path.display()))?;
+            decrypt_seed(e, &f.address, p).map_err(|e| format!("{}: {e}", path.display()))?
+        }
+        (None, Some(seed)) => {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| eprintln!("warning: {} is not encrypted (see `wallet encrypt-key`)", path.display()));
+            hex::decode(seed).map_err(|e| e.to_string())?.try_into().map_err(|_| "seed must be 32 bytes")?
+        }
+        (None, None) => return Err(format!("{}: key file has no seed", path.display())),
+    };
     let alg = [ALG_ML_DSA_65, ALG_SLH_DSA_SHAKE_128S]
         .into_iter()
         .find(|a| alg_name(*a) == f.algorithm)

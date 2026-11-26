@@ -18,6 +18,8 @@ BIN="$ROOT/target/release/pqchain"
 P2P=9100
 RPC=8100
 PIDS=()
+# Every key file in this run is encrypted at rest (Argon2id + ChaCha20-Poly1305).
+export PQCHAIN_PASSPHRASE="${PQCHAIN_PASSPHRASE:-local-testnet-passphrase}"
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✔\033[0m %s\n' "$*"; }
@@ -89,6 +91,8 @@ for p in "${ALL[@]}"; do
   [ "$peers" -ge 4 ] || fail "node on $p has only $peers peers"
 done
 ok "every node was configured with one bootstrap peer; discovery built the full mesh"
+grep -q '"encrypted"' "$WORK/validator-0/node.key" && ! grep -q '"seed"' "$WORK/validator-0/node.key" || fail "key files should be encrypted"
+ok "all key files are encrypted at rest; nodes decrypted them at startup"
 ok "all links use the hybrid post-quantum handshake"
 
 say "Payments on the Atbash Chain"

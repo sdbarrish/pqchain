@@ -98,6 +98,12 @@ scripts/bridge-testnet.sh                                           # two live n
 
 Not supported yet: bridges to non-PQ-Chain networks (Bitcoin, Ethereum), skipping light-client updates (every Kerckhoffs header is applied in order), and token types other than each network's native token.
 
+## Key files
+
+Set `PQCHAIN_PASSPHRASE` before creating keys (`wallet new`, `testnet-init`) to encrypt them at rest
+with Argon2id + ChaCha20-Poly1305; nodes and wallet commands then need the same variable to start.
+Convert an existing plaintext key with `pqchain wallet encrypt-key --key <file>`.
+
 ## Audit preparation
 
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md): the protocol rules, with the code location enforcing each

@@ -8,6 +8,7 @@
 //!   finality certificate plus a Merkle inclusion proof.
 
 use crate::consensus::{FinalityCert, LightClient};
+use crate::hamming::{self, BlobCommitment};
 use crate::feistel::{self, Action, FeistelState, FeistelTx, Receipt, BASE_FEE, MAX_FUEL};
 use crate::crypto::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +43,8 @@ pub enum ChainId {
     Atbash,
     /// Smart-contract chain (WebAssembly, account-based).
     Feistel,
+    /// Data-availability chain (erasure-coded blobs).
+    Hamming,
     /// Application chain registered on the Kerckhoffs Chain.
     Zone(u32),
 }
@@ -53,6 +56,7 @@ impl ChainId {
             ChainId::Kerckhoffs => 0,
             ChainId::Atbash => 1,
             ChainId::Feistel => 2,
+            ChainId::Hamming => 3,
             // Codes 3-15 are reserved for future primary chains (Hamming, Playfair).
             ChainId::Zone(n) => 16 + n as u64,
         }
@@ -62,6 +66,7 @@ impl ChainId {
             ChainId::Kerckhoffs => "Kerckhoffs Chain".into(),
             ChainId::Atbash => "Atbash Chain".into(),
             ChainId::Feistel => "Feistel Chain".into(),
+            ChainId::Hamming => "Hamming Chain".into(),
             ChainId::Zone(n) => format!("Zone {n}"),
         }
     }
@@ -75,6 +80,7 @@ impl ChainId {
             ChainId::Kerckhoffs => ctx::KERCKHOFFS_TX.to_vec(),
             ChainId::Atbash => ctx::ATBASH_TX.to_vec(),
             ChainId::Feistel => ctx::FEISTEL_TX.to_vec(),
+            ChainId::Hamming => ctx::HAMMING_TX.to_vec(),
             ChainId::Zone(n) => format!("pqchain/v2/zone/{n}/tx").into_bytes(),
         }
     }
@@ -277,6 +283,39 @@ impl AtbashTx {
     }
 }
 
+/// Hamming Chain transaction: posts a blob (possibly empty, which makes it a
+/// plain transfer) and pays a per-byte fee. Carries the blob's commitment so
+/// the id can be computed and checked without the data; validators verify
+/// the commitment against the data.
+#[derive(Clone, Debug)]
+pub struct BlobTx {
+    pub base: Transfer,
+    pub namespace: [u8; 8],
+    pub commitment: BlobCommitment,
+    pub data: Vec<u8>,
+}
+
+impl BlobTx {
+    /// Hash of everything except the blob (payment and namespace).
+    pub fn prefix_hash(&self) -> Hash {
+        let mut e = Enc::new("pqchain/hamming-prefix");
+        self.base.encode(&mut e);
+        e.bytes(&self.namespace);
+        e.hash()
+    }
+    pub fn id(&self) -> Hash {
+        hamming::tx_id(&self.prefix_hash(), &self.commitment)
+    }
+    pub fn new(base: Transfer, namespace: [u8; 8], data: Vec<u8>) -> Self {
+        BlobTx { base, namespace, commitment: hamming::commit(&data), data }
+    }
+    pub fn sign(mut self, keys: &[&Keypair]) -> Self {
+        let id = self.id();
+        self.base.sign_all(ctx::HAMMING_TX, &id, keys);
+        self
+    }
+}
+
 /// A signed block header: what a proposer commits to.
 #[derive(Clone, Debug)]
 pub struct SignedHeader {
@@ -430,6 +469,7 @@ pub enum Body {
     Atbash(Vec<AtbashTx>),
     Kerckhoffs(Vec<KerckhoffsTx>),
     Feistel(Vec<FeistelTx>),
+    Hamming(Vec<BlobTx>),
 }
 
 impl Body {
@@ -438,6 +478,7 @@ impl Body {
             Body::Atbash(t) => t.iter().map(AtbashTx::id).collect(),
             Body::Kerckhoffs(t) => t.iter().map(KerckhoffsTx::id).collect(),
             Body::Feistel(t) => t.iter().map(FeistelTx::id).collect(),
+            Body::Hamming(t) => t.iter().map(BlobTx::id).collect(),
         }
     }
     pub fn len(&self) -> usize {
@@ -445,6 +486,7 @@ impl Body {
             Body::Atbash(t) => t.len(),
             Body::Kerckhoffs(t) => t.len(),
             Body::Feistel(t) => t.len(),
+            Body::Hamming(t) => t.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -567,6 +609,7 @@ pub struct Delegation {
 pub struct Ledger {
     pub atbash_utxos: BTreeMap<OutPoint, TxOut>,
     pub kerckhoffs_utxos: BTreeMap<OutPoint, TxOut>,
+    pub hamming_utxos: BTreeMap<OutPoint, TxOut>,
     /// (destination chain, outpoint) -> output waiting to be imported.
     pub atomic: BTreeMap<(ChainId, OutPoint), TxOut>,
     pub validators: ValidatorSet,
@@ -620,7 +663,7 @@ impl Ledger {
                 },
             );
         }
-        for c in [ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel] {
+        for c in [ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel, ChainId::Hamming] {
             l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u64(c.code()).hash()));
             l.anchors.insert(c, 0);
         }
@@ -635,7 +678,7 @@ impl Ledger {
 
     /// Every chain this ledger tracks: the two primary chains plus zones.
     pub fn chains(&self) -> Vec<ChainId> {
-        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel];
+        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel, ChainId::Hamming];
         v.extend(self.zones.keys().map(|n| ChainId::Zone(*n)));
         v
     }
@@ -649,7 +692,7 @@ impl Ledger {
     pub fn chain_validators(&self, chain: ChainId, anchor: u64) -> Option<ValidatorSet> {
         let set = self.validators_at(anchor)?;
         match chain {
-            ChainId::Kerckhoffs | ChainId::Atbash | ChainId::Feistel => Some(set.clone()),
+            ChainId::Kerckhoffs | ChainId::Atbash | ChainId::Feistel | ChainId::Hamming => Some(set.clone()),
             ChainId::Zone(n) => {
                 let z = self.zones.get(&n)?;
                 if z.created_at > anchor {
@@ -706,11 +749,13 @@ impl Ledger {
             ChainId::Atbash => &self.atbash_utxos,
             ChainId::Zone(n) => self.zone_utxos.get(&n).unwrap_or(&EMPTY_UTXOS),
             ChainId::Feistel => &EMPTY_UTXOS, // account-based
+            ChainId::Hamming => &self.hamming_utxos,
         }
     }
     fn utxos_mut(&mut self, chain: ChainId) -> &mut BTreeMap<OutPoint, TxOut> {
         match chain {
             ChainId::Kerckhoffs => &mut self.kerckhoffs_utxos,
+            ChainId::Hamming => &mut self.hamming_utxos,
             ChainId::Atbash => &mut self.atbash_utxos,
             ChainId::Zone(n) => self.zone_utxos.entry(n).or_default(),
             ChainId::Feistel => unreachable!("the Feistel Chain is account-based (apply_utxo rejects it)"),
@@ -837,6 +882,11 @@ impl Ledger {
                 if dest == ChainId::Feistel && chain != ChainId::Atbash {
                     return Err("the Feistel Chain is funded from the Atbash Chain only".into());
                 }
+                if (chain == ChainId::Hamming && dest != ChainId::Atbash)
+                    || (dest == ChainId::Hamming && chain != ChainId::Atbash)
+                {
+                    return Err("the Hamming Chain exchanges value with the Atbash Chain only".into());
+                }
                 if !self.knows(dest) {
                     return Err("export to an unknown chain".into());
                 }
@@ -946,13 +996,43 @@ impl Ledger {
         Ok(receipt)
     }
 
+    /// Apply a Hamming blob transaction.
+    pub fn apply_blob(&mut self, tx: &BlobTx) -> Result<(), String> {
+        self.atomically(|l| l.apply_blob_inner(tx))
+    }
+
+    fn apply_blob_inner(&mut self, tx: &BlobTx) -> Result<(), String> {
+        if tx.data.len() > hamming::MAX_BLOB {
+            return Err(format!("blob larger than {} bytes", hamming::MAX_BLOB));
+        }
+        if tx.base.inputs.is_empty() {
+            return Err("transaction has no inputs".into());
+        }
+        if hamming::commit(&tx.data) != tx.commitment {
+            return Err("blob commitment does not match the data (bad encoding)".into());
+        }
+        let id = tx.id();
+        let ins = self.spend_inputs(ChainId::Hamming, &tx.base, &id, ctx::HAMMING_TX)?;
+        let outs = self.create_outputs(ChainId::Hamming, &tx.base, &id)?;
+        if ins.keys().chain(outs.keys()).any(|a| *a != NATIVE) {
+            return Err("only the native token lives on the Hamming Chain".into());
+        }
+        let n_in = ins.get(&NATIVE).copied().unwrap_or(0);
+        let n_out = outs.get(&NATIVE).copied().unwrap_or(0);
+        if n_in < n_out + hamming::blob_fee(tx.data.len()) as u128 {
+            return Err("inputs do not cover outputs + blob fee".into());
+        }
+        self.burned += (n_in - n_out) as u64;
+        Ok(())
+    }
+
     /// Apply a UTXO transaction on the Atbash Chain or a zone.
     pub fn apply_utxo(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
         self.atomically(|l| l.apply_utxo_inner(chain, tx))
     }
 
     fn apply_utxo_inner(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
-        if matches!(chain, ChainId::Kerckhoffs | ChainId::Feistel) || !self.knows(chain) {
+        if matches!(chain, ChainId::Kerckhoffs | ChainId::Feistel | ChainId::Hamming) || !self.knows(chain) {
             return Err(format!("{} does not take UTXO transactions", chain.name()));
         }
         let id = tx.id();
@@ -1217,10 +1297,10 @@ impl Ledger {
             ChainId::Kerckhoffs if h.anchor != k_tip => {
                 return Err("Kerckhoffs block must anchor to its parent height".into())
             }
-            ChainId::Atbash | ChainId::Feistel | ChainId::Zone(_) if h.anchor > k_tip => {
+            ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Zone(_) if h.anchor > k_tip => {
                 return Err("anchor is ahead of the local Kerckhoffs tip (retry later)".into())
             }
-            ChainId::Atbash | ChainId::Feistel | ChainId::Zone(_)
+            ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Zone(_)
                 if h.anchor < self.anchors.get(&h.chain).copied().unwrap_or(0) =>
             {
                 return Err("anchor went backwards".into())
@@ -1269,6 +1349,14 @@ impl Ledger {
                     self.apply_feistel_inner(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
+            (Body::Hamming(txs), ChainId::Hamming) => {
+                if txs.iter().map(|t| t.data.len()).sum::<usize>() > hamming::MAX_BLOCK_DATA {
+                    return Err("block carries too much blob data".into());
+                }
+                for (i, t) in txs.iter().enumerate() {
+                    self.apply_blob_inner(t).map_err(|e| format!("tx {i}: {e}"))?;
+                }
+            }
             _ => return Err("body does not match chain".into()),
         }
         self.distribute_rewards(h.chain, h.anchor);
@@ -1293,6 +1381,7 @@ impl Ledger {
         };
         native(&self.atbash_utxos)
             + native(&self.kerckhoffs_utxos)
+            + native(&self.hamming_utxos)
             + self.zone_utxos.values().map(native).sum::<u128>()
             + self.atomic.values().filter(|o| o.asset == NATIVE).map(|o| o.amount as u128).sum::<u128>()
             + self.feistel.balances.values().map(|b| *b as u128).sum::<u128>()
@@ -1304,7 +1393,7 @@ impl Ledger {
     /// Commitment to the entire state; replicas must agree on this.
     pub fn state_root(&self) -> Hash {
         let mut e = Enc::new("pqchain/state");
-        for (c, m) in [(0u8, &self.atbash_utxos), (1, &self.kerckhoffs_utxos)] {
+        for (c, m) in [(0u8, &self.atbash_utxos), (1, &self.kerckhoffs_utxos), (3, &self.hamming_utxos)] {
             e.u8(c).u64(m.len() as u64);
             for (p, o) in m {
                 e.bytes(&p.txid).u64(p.index as u64);
@@ -1362,6 +1451,7 @@ pub fn propose_round(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64,
         Body::Atbash(_) => ChainId::Atbash,
         Body::Kerckhoffs(_) => ChainId::Kerckhoffs,
         Body::Feistel(_) => ChainId::Feistel,
+        Body::Hamming(_) => ChainId::Hamming,
     };
     propose_on(ledger, key, chain, body, timestamp, round)
 }

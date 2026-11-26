@@ -220,6 +220,20 @@ COUNT=$("$BIN" wallet --rpc http://127.0.0.1:8104 feistel-query --contract "$COU
 [ "$COUNT" = 3 ] || fail "counter should read 3, got $COUNT"
 ok "counter contract deployed and incremented 3 times; full node reads count = $COUNT"
 
+say "Hamming Chain: data availability"
+A0=$(height 8104 atbash)
+wallet export --key "$WORK/alice.key" --amount 5000 --from atbash --to hamming >/dev/null
+wait_all atbash $((A0 + 1)) "${ALL[@]}"
+wallet import --key "$WORK/alice.key" --chain hamming >/dev/null
+wait_all hamming 1 "${ALL[@]}"
+wallet hamming-post --key "$WORK/alice.key" --namespace rollup1 --file "$ROOT/README.md" | sed 's/^/  /'
+wait_all hamming 2 "${ALL[@]}"
+for _ in $(seq 1 50); do rpc 8104 /hamming/proof/2/0 >/dev/null 2>&1 && break; sleep 0.2; done
+"$BIN" wallet --rpc http://127.0.0.1:8104 hamming-sample --height 2 --samples 20 | sed 's/^/  /'
+"$BIN" wallet --rpc http://127.0.0.1:8104 hamming-get --height 2 --out "$WORK/blob.out" | sed 's/^/  /'
+cmp -s "$ROOT/README.md" "$WORK/blob.out" || fail "rebuilt blob differs from the original"
+ok "light client verified inclusion + 20 random shards; the blob was rebuilt from a random half of its shards, byte-identical"
+
 say "Staking rewards"
 W0=$(wallet show --key "$WORK/validator-0/withdrawal.key")
 MINTED=$(rpc 8104 /status | jget "d['minted']")

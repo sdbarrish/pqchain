@@ -47,6 +47,7 @@ pub mod ctx {
     pub const EXIT: &[u8] = b"pqchain/v2/validator-exit";
     pub const CLAIM: &[u8] = b"pqchain/v3/claim-rewards";
     pub const FEISTEL_TX: &[u8] = b"pqchain/v3/feistel/tx";
+    pub const HAMMING_TX: &[u8] = b"pqchain/v3/hamming/tx";
 }
 
 /// Canonical, length-prefixed encoder used for every hash in the protocol.

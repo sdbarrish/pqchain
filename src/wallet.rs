@@ -70,6 +70,7 @@ fn native_only(v: Vec<(OutPoint, TxOut)>) -> Vec<(OutPoint, TxOut)> {
 fn wrap(chain: ChainId, base: Transfer, kind: KerckhoffsKind, n: usize, key: &Keypair) -> Tx {
     match chain {
         ChainId::Kerckhoffs => Tx::Kerckhoffs(KerckhoffsTx { base, kind }.sign(&vec![key; n])),
+        ChainId::Hamming => Tx::Hamming(BlobTx::new(base, [0; 8], Vec::new()).sign(&vec![key; n])),
         _ => Tx::Utxo(chain, AtbashTx { base, create_asset: None }.sign_for(chain, &vec![key; n])),
     }
 }
@@ -93,6 +94,105 @@ pub fn feistel_import(c: &Client, key: &Keypair) -> Result<(Tx, u64), String> {
     }
     let outpoints = pool.into_iter().map(|(p, _)| p).take(256).collect();
     Ok((feistel(c, key, 0, crate::feistel::Action::Import { outpoints })?, total))
+}
+
+/// Post a blob to the Hamming Chain (fee paid from Hamming Chain funds).
+pub fn hamming_post(c: &Client, key: &Keypair, namespace: &str, data: Vec<u8>) -> Result<Tx, String> {
+    if namespace.len() > 8 {
+        return Err("namespace is at most 8 bytes".into());
+    }
+    let mut ns = [0u8; 8];
+    ns[..namespace.len()].copy_from_slice(namespace.as_bytes());
+    let pool = native_only(c.utxos(ChainId::Hamming, &key.address())?);
+    let extra = crate::hamming::blob_fee(data.len()) - TX_FEE;
+    let (base, n) = native_transfer_from_pool(pool, Source::Local, key, vec![], None, extra)?;
+    Ok(Tx::Hamming(BlobTx::new(base, ns, data).sign(&vec![key; n])))
+}
+
+/// The current validator set as published by the node (a light-client
+/// checkpoint: a production light client would track it via Kerckhoffs
+/// Chain certificates from genesis instead of trusting one node).
+pub fn validator_checkpoint(c: &Client) -> Result<ValidatorSet, String> {
+    let v = c.get("/validators")?;
+    let mut set = ValidatorSet::new();
+    for x in v["validators"].as_array().ok_or("unexpected RPC reply")? {
+        let key = PublicKey {
+            alg: ALG_ML_DSA_65,
+            bytes: hex::decode(x["signing_key"].as_str().unwrap_or("")).map_err(|e| e.to_string())?,
+        };
+        let node_id = key.address();
+        if x["node_id"].as_str() != Some(node_id.to_text().as_str()) {
+            return Err("node returned an inconsistent validator key".into());
+        }
+        set.insert(
+            node_id,
+            Validator {
+                node_id,
+                signing_key: key,
+                withdrawal: Address::from_text(x["withdrawal"].as_str().unwrap_or(""))?,
+                stake: x["weight"].as_u64().unwrap_or(0),
+                delegated: 0,
+                slashed: x["slashed"].as_bool().unwrap_or(false),
+                exit_at: None,
+            },
+        );
+    }
+    Ok(set)
+}
+
+fn shard(c: &Client, height: u64, index: usize, i: u32) -> Result<(Vec<u8>, Vec<Hash>), String> {
+    let v = c.get(&format!("/hamming/shard/{height}/{index}/{i}"))?;
+    let shard = hex::decode(v["shard"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+    let branch = v["branch"]
+        .as_array()
+        .ok_or("unexpected RPC reply")?
+        .iter()
+        .map(|h| hex::decode(h.as_str().unwrap_or("")).ok().and_then(|b| b.try_into().ok()).ok_or("bad hash"))
+        .collect::<Result<Vec<Hash>, _>>()?;
+    Ok((shard, branch))
+}
+
+/// Light-client data-availability check: verify the blob is in a finalized
+/// block, then fetch and verify `samples` random shards. Returns the
+/// commitment and the indices sampled.
+pub fn hamming_sample(c: &Client, height: u64, index: usize, samples: u32) -> Result<(crate::hamming::BlobCommitment, Vec<u32>), String> {
+    let p = c.get(&format!("/hamming/proof/{height}/{index}"))?;
+    let proof = crate::hamming::InclusionProof::from_bytes(
+        &hex::decode(p["proof"].as_str().ok_or("no proof")?).map_err(|e| e.to_string())?,
+    )?;
+    proof.verify(&validator_checkpoint(c)?)?;
+    let cm = proof.commitment;
+    let mut picked = Vec::new();
+    for _ in 0..samples {
+        let i = rand::random_range(0..cm.shards());
+        let (s, branch) = shard(c, height, index, i)?;
+        if !crate::hamming::verify_shard(&cm, i, &s, &branch) {
+            return Err(format!("shard {i} failed verification: data may be unavailable"));
+        }
+        picked.push(i);
+    }
+    Ok((cm, picked))
+}
+
+/// Download any `k` random shards (deliberately mixing data and parity) and
+/// rebuild the blob, checking each shard and the result.
+pub fn hamming_get(c: &Client, height: u64, index: usize) -> Result<(Vec<u8>, Vec<u32>), String> {
+    let (cm, _) = hamming_sample(c, height, index, 0)?;
+    let n = cm.shards();
+    let mut order: Vec<u32> = (0..n).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, rand::random_range(0..=i));
+    }
+    let mut slots: Vec<Option<Vec<u8>>> = vec![None; n as usize];
+    let used: Vec<u32> = order.into_iter().take(cm.k as usize).collect();
+    for &i in &used {
+        let (s, branch) = shard(c, height, index, i)?;
+        if !crate::hamming::verify_shard(&cm, i, &s, &branch) {
+            return Err(format!("shard {i} failed verification"));
+        }
+        slots[i as usize] = Some(s);
+    }
+    Ok((crate::hamming::reconstruct(&cm, slots)?, used))
 }
 
 /// Claim accumulated staking rewards for this key's address.

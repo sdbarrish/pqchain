@@ -121,6 +121,7 @@ pub fn encode(l: &Ledger, records: u64) -> Vec<u8> {
     w.u64(records);
     put_utxos(&mut w, &l.atbash_utxos);
     put_utxos(&mut w, &l.kerckhoffs_utxos);
+    put_utxos(&mut w, &l.hamming_utxos);
     w.u64(l.atomic.len() as u64);
     for ((c, p), o) in &l.atomic {
         c.put(&mut w);
@@ -188,7 +189,7 @@ pub fn encode(l: &Ledger, records: u64) -> Vec<u8> {
 pub fn decode(b: &[u8]) -> DecodeResult<(Ledger, u64)> {
     let mut r = Reader::new(b);
     let records = r.u64()?;
-    let mut l = Ledger { atbash_utxos: get_utxos(&mut r)?, kerckhoffs_utxos: get_utxos(&mut r)?, ..Default::default() };
+    let mut l = Ledger { atbash_utxos: get_utxos(&mut r)?, kerckhoffs_utxos: get_utxos(&mut r)?, hamming_utxos: get_utxos(&mut r)?, ..Default::default() };
     let mut prev = None;
     for _ in 0..count(&mut r)? {
         let k = ordered(&mut prev, (ChainId::get(&mut r)?, OutPoint::get(&mut r)?))?;

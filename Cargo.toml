@@ -12,6 +12,7 @@ hex = "0.4.3"
 libcrux-ml-dsa = "0.0.12"
 libcrux-ml-kem = "0.0.12"
 rand = "0.10"
+reed-solomon-erasure = "6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha3 = "0.12"

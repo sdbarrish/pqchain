@@ -12,6 +12,7 @@ pub mod codec;
 pub mod consensus;
 pub mod crypto;
 pub mod feistel;
+pub mod hamming;
 pub mod ledger;
 pub mod network;
 pub mod node;

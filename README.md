@@ -9,7 +9,7 @@ Each chain is named after a piece of cryptographic history:
 | **Kerckhoffs Chain** | Staking, validator registry, delegation, slashing, governance | Kerckhoffs's principle (1883): security must rest only in the keys, just as the network's security rests in validator keys |
 | **Atbash Chain** | UTXO payments and user-created assets | Atbash, one of the oldest known ciphers, for the chain that carries the most basic use: moving value |
 | **Feistel Chain** | WebAssembly smart contracts with post-quantum accounts | Feistel networks, which build complex ciphers from simple, composable rounds, as contracts compose |
-| **Hamming Chain** *(planned)* | Hash-based data availability for rollups | Hamming codes, the first error-correcting codes; data availability relies on erasure coding |
+| **Hamming Chain** | Hash-based data availability for rollups and zones | Hamming codes, the first error-correcting codes; data availability relies on erasure coding |
 | **Playfair Chain** *(planned)* | Bridges to other networks | The Playfair cipher, which works on pairs of letters, as a bridge links pairs of chains |
 | **Zones** | Application chains validated by a chosen subset of primary validators | |
 
@@ -54,6 +54,26 @@ Not yet supported: contract-to-contract calls, contract upgrades, an EVM compati
 - **Rewards:** each accepted block issues 1,000 native tokens, split across that chain's validators by stake. Delegators are paid pro rata minus a 10% commission. Claim with `wallet claim-rewards --key <withdrawal or reward key>` (replay-protected by a nonce).
 - **Peer discovery:** nodes announce their address and gossip known peers. A node needs one bootstrap peer; identities are pinned in the handshake.
 - **Snapshots:** every 20 log records the node writes a checksummed ledger snapshot. A restart loads it and re-executes only later records.
+
+## Hamming Chain (data availability)
+
+| Piece | Implementation |
+|---|---|
+| Blobs | Up to 128 KB each (2 MB per block), tagged with an 8-byte namespace. Fee: 1 + 1 per 256 bytes, burned. |
+| Erasure coding | Reed–Solomon at rate 1/2: `k` data + `k` parity shards (`k` ≤ 64); any `k` shards rebuild the blob. |
+| Commitment | Merkle root over the shards (hash-based, post-quantum; no KZG). Validators re-encode every blob, so a certified block has a correct encoding. |
+| Light clients | Verify the block's finality certificate and the blob's inclusion in `tx_root`, then sample random shards with Merkle proofs. Withholding needs > half the shards, so `s` verified samples leave < 2^-s chance of unavailability. |
+| Funding | Atbash Chain ↔ Hamming Chain via atomic memory. |
+
+```bash
+pqchain wallet export --key alice.key --amount 5000 --from atbash --to hamming
+pqchain wallet import --key alice.key --chain hamming
+pqchain wallet hamming-post --key alice.key --namespace rollup1 --file data.bin
+pqchain wallet hamming-sample --height 2 --samples 20      # light-client availability check
+pqchain wallet hamming-get --height 2 --out rebuilt.bin    # rebuild from a random half of the shards
+```
+
+Limits: the light client takes the validator set from one node as a checkpoint (a production client would follow Kerckhoffs Chain certificates from genesis); nodes keep all blobs (no pruning yet); there is no fraud-proof path for nodes that only sample.
 
 ## Hardening (v3)
 
@@ -158,7 +178,8 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 - **v2 step 2 (done)**: zones (application chains validated by a subset of primary validators, registered on the Kerckhoffs Chain) and relay messages: cross-chain transfers proven by the source block's finality certificate plus a Merkle inclusion proof, claimable exactly once
 - **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
 - **v3 hardening (done)**: fuzzing (4 targets, 2 bugs fixed), Kani proofs, atomic transaction application
-- **v3 remaining**: Hamming Chain (hash-based data availability), Playfair Chain bridges, external audits
+- **v3 Hamming Chain (done)**: erasure-coded blobs, hash-based commitments, light-client sampling
+- **v3 remaining**: Playfair Chain bridges, external audits
 
 ## Credits
 

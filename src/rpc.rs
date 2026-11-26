@@ -13,6 +13,9 @@
 //! GET  /feistel/contract/{address}  contract code hash, creator, balance, storage size
 //! GET  /feistel/receipt/{txid}      result of a Feistel transaction
 //! POST /feistel/query/{address}/{method}  read-only call; body = hex input
+//! GET  /hamming/blobs/{height}             blobs in a Hamming block
+//! GET  /hamming/proof/{height}/{index}     light-client inclusion proof (hex)
+//! GET  /hamming/shard/{height}/{index}/{i} one erasure-coded shard + Merkle path
 //! POST /tx                          hex-encoded signed transaction
 
 use crate::codec::{Tx, Wire};
@@ -58,6 +61,7 @@ async fn validators(State(e): State<Shared>) -> Json<Value> {
                 "node_id": v.node_id.to_text(), "stake": v.stake, "delegated": v.delegated,
                 "weight": v.weight(), "slashed": v.slashed, "withdrawal": v.withdrawal.to_text(),
                 "exit_at": v.exit_at,
+                "signing_key": hex::encode(&v.signing_key.bytes), "stake_own": v.stake,
                 "connected": e.peers.contains_key(&v.node_id) || v.node_id == e.me,
             })
         })
@@ -161,6 +165,36 @@ async fn feistel_query(State(e): State<Shared>, Path((addr, method)): Path<(Stri
     Ok(Json(json!({ "output_hex": hex::encode(&out), "as_u64": as_u64 })))
 }
 
+fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
+}
+
+async fn hamming_blobs(State(e): State<Shared>, Path(height): Path<u64>) -> Reply {
+    let e = e.lock().unwrap();
+    let mut out = Vec::new();
+    while let Some((_, cert, tx)) = e.blob(height, out.len()) {
+        out.push(json!({
+            "index": out.len(), "namespace": String::from_utf8_lossy(&tx.namespace).trim_end_matches('\0').to_string(),
+            "bytes": tx.data.len(), "shards": tx.commitment.shards(), "data_shards": tx.commitment.k,
+            "commitment": hex::encode(tx.commitment.to_bytes()), "certified": cert.is_some(),
+        }));
+    }
+    Ok(Json(json!(out)))
+}
+
+async fn hamming_proof(State(e): State<Shared>, Path((height, index)): Path<(u64, usize)>) -> Reply {
+    let e = e.lock().unwrap();
+    let p = e.blob_inclusion(height, index).ok_or_else(|| not_found("no certified blob at this position"))?;
+    Ok(Json(json!({ "proof": hex::encode(p.to_bytes()) })))
+}
+
+async fn hamming_shard(State(e): State<Shared>, Path((height, index, i)): Path<(u64, usize, usize)>) -> Reply {
+    let e = e.lock().unwrap();
+    let (_, _, tx) = e.blob(height, index).ok_or_else(|| not_found("no such blob"))?;
+    let (shard, branch) = crate::hamming::shard_with_proof(&tx.data, i).ok_or_else(|| not_found("no such shard"))?;
+    Ok(Json(json!({ "shard": hex::encode(shard), "branch": branch.iter().map(hex::encode).collect::<Vec<_>>() })))
+}
+
 async fn zones(State(e): State<Shared>) -> Json<Value> {
     Json(e.lock().unwrap().status_json()["zones"].clone())
 }
@@ -188,6 +222,9 @@ pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
         .route("/feistel/contract/{addr}", get(feistel_contract))
         .route("/feistel/receipt/{txid}", get(feistel_receipt))
         .route("/feistel/query/{addr}/{method}", post(feistel_query))
+        .route("/hamming/blobs/{height}", get(hamming_blobs))
+        .route("/hamming/proof/{height}/{index}", get(hamming_proof))
+        .route("/hamming/shard/{height}/{index}/{i}", get(hamming_shard))
         .route("/tx", post(submit))
         .with_state(engine);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("rpc {addr}: {e}"))?;

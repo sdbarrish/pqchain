@@ -200,6 +200,34 @@ enum WalletCmd {
         #[arg(long)]
         txid: String,
     },
+    /// Hamming Chain: post a blob (data availability).
+    HammingPost {
+        #[arg(long)]
+        key: PathBuf,
+        /// Up to 8 bytes, e.g. a rollup name.
+        #[arg(long)]
+        namespace: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Hamming Chain: light-client availability check by random sampling.
+    HammingSample {
+        #[arg(long)]
+        height: u64,
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+        #[arg(long, default_value_t = 16)]
+        samples: u32,
+    },
+    /// Hamming Chain: rebuild a blob from a random half of its shards.
+    HammingGet {
+        #[arg(long)]
+        height: u64,
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Start a validator's exit (signed by its cold withdrawal key).
     Exit {
         /// Withdrawal key file of the validator.
@@ -367,6 +395,29 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
             println!("{}", reply.into_string().map_err(|e| e.to_string())?);
         }
         WalletCmd::FeistelReceipt { txid } => println!("{}", c.get(&format!("/feistel/receipt/{txid}"))?),
+        WalletCmd::HammingPost { key, namespace, file } => {
+            let k = node::load_key(&key)?;
+            let data = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            let tx = wallet::hamming_post(&c, &k, &namespace, data)?;
+            if let pqchain::codec::Tx::Hamming(t) = &tx {
+                println!(
+                    "blob: {} bytes -> {} shards ({} data + {} parity), commitment {}",
+                    t.data.len(), t.commitment.shards(), t.commitment.k, t.commitment.k, hex::encode(&t.commitment.root[..8])
+                );
+            }
+            submit(&c, tx)?;
+        }
+        WalletCmd::HammingSample { height, index, samples } => {
+            let (cm, picked) = wallet::hamming_sample(&c, height, index, samples)?;
+            println!("blob included in finalized Hamming block #{height} (certificate checked)");
+            println!("sampled shards {picked:?} of {}: all verified", cm.shards());
+            println!("probability the blob is unavailable: < {:.1e}", pqchain::hamming::miss_probability(samples));
+        }
+        WalletCmd::HammingGet { height, index, out } => {
+            let (data, used) = wallet::hamming_get(&c, height, index)?;
+            std::fs::write(&out, &data).map_err(|e| e.to_string())?;
+            println!("rebuilt {} bytes from shards {used:?} -> {}", data.len(), out.display());
+        }
         WalletCmd::Exit { withdrawal_key, node } => {
             let k = node::load_key(&withdrawal_key)?;
             submit(&c, wallet::exit(Address::from_text(&node)?, &k))?;

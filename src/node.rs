@@ -47,6 +47,7 @@ pub fn chain_from_str(s: &str) -> Result<ChainId, String> {
         "kerckhoffs" | "k" => Ok(ChainId::Kerckhoffs),
         "atbash" | "a" => Ok(ChainId::Atbash),
         "feistel" | "f" => Ok(ChainId::Feistel),
+        "hamming" | "h" => Ok(ChainId::Hamming),
         _ => s
             .strip_prefix("zone-")
             .or_else(|| s.strip_prefix("zone:"))
@@ -61,6 +62,7 @@ pub fn chain_slug(c: ChainId) -> String {
         ChainId::Kerckhoffs => "kerckhoffs".into(),
         ChainId::Atbash => "atbash".into(),
         ChainId::Feistel => "feistel".into(),
+        ChainId::Hamming => "hamming".into(),
         ChainId::Zone(n) => format!("zone-{n}"),
     }
 }
@@ -931,6 +933,16 @@ impl Engine {
                 ChainId::Feistel => Body::Feistel(
                     picked.into_iter().filter_map(|t| if let Tx::Feistel(t) = t { Some(t) } else { None }).collect(),
                 ),
+                ChainId::Hamming => {
+                    let mut room = crate::hamming::MAX_BLOCK_DATA;
+                    Body::Hamming(
+                        picked
+                            .into_iter()
+                            .filter_map(|t| if let Tx::Hamming(t) = t { Some(t) } else { None })
+                            .take_while(|t| room.checked_sub(t.data.len()).map(|r| room = r).is_some())
+                            .collect(),
+                    )
+                }
                 _ => Body::Atbash(
                     picked.into_iter().filter_map(|t| if let Tx::Utxo(_, t) = t { Some(t) } else { None }).collect(),
                 ),
@@ -1095,6 +1107,7 @@ impl Engine {
             "kerckhoffs": chain(ChainId::Kerckhoffs),
             "atbash": chain(ChainId::Atbash),
             "feistel": chain(ChainId::Feistel),
+            "hamming": chain(ChainId::Hamming),
             "contracts": self.ledger.feistel.contracts.len(),
             "zones": zones,
             "mempool": self.mempool.len(),
@@ -1102,6 +1115,26 @@ impl Engine {
             "total_stake": self.ledger.total_weight(),
             "burned": self.ledger.burned,
             "minted": self.ledger.minted,
+        })
+    }
+
+    /// A posted blob: its block, the block's certificate (if formed) and the tx.
+    pub fn blob(&self, height: u64, index: usize) -> Option<(&Block, Option<&FinalityCert>, &BlobTx)> {
+        let (b, cert) = self.accepted.get(&(ChainId::Hamming, height))?;
+        let Body::Hamming(txs) = &b.body else { return None };
+        Some((b, cert.as_ref(), txs.get(index)?))
+    }
+
+    /// Light-client inclusion proof for a blob (needs the finality certificate).
+    pub fn blob_inclusion(&self, height: u64, index: usize) -> Option<crate::hamming::InclusionProof> {
+        let (b, cert, tx) = self.blob(height, index)?;
+        Some(crate::hamming::InclusionProof {
+            header: b.header().clone(),
+            cert: cert?.clone(),
+            prefix_hash: tx.prefix_hash(),
+            commitment: tx.commitment,
+            tx_index: index as u32,
+            tx_branch: merkle_branch(&b.body.tx_ids(), index),
         })
     }
 

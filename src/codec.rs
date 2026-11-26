@@ -7,6 +7,7 @@
 use crate::consensus::FinalityCert;
 use crate::crypto::*;
 use crate::feistel::{Action, FeistelTx};
+use crate::hamming::BlobCommitment;
 use crate::ledger::*;
 
 pub const MAX_BYTES: usize = 1 << 20; // any single byte string
@@ -166,6 +167,7 @@ impl Wire for ChainId {
             ChainId::Kerckhoffs => w.u8(0),
             ChainId::Atbash => w.u8(1),
             ChainId::Feistel => w.u8(3),
+            ChainId::Hamming => w.u8(4),
             ChainId::Zone(n) => {
                 w.u8(2);
                 w.u32(*n);
@@ -178,6 +180,7 @@ impl Wire for ChainId {
             1 => Ok(ChainId::Atbash),
             2 => Ok(ChainId::Zone(r.u32()?)),
             3 => Ok(ChainId::Feistel),
+            4 => Ok(ChainId::Hamming),
             _ => Err("unknown chain id".into()),
         }
     }
@@ -459,6 +462,10 @@ impl Wire for Block {
                 w.u8(2);
                 w.list(t);
             }
+            Body::Hamming(t) => {
+                w.u8(3);
+                w.list(t);
+            }
             Body::Kerckhoffs(t) => {
                 w.u8(0);
                 w.list(t);
@@ -475,6 +482,7 @@ impl Wire for Block {
             0 => Body::Kerckhoffs(r.list()?),
             1 => Body::Atbash(r.list()?),
             2 => Body::Feistel(r.list()?),
+            3 => Body::Hamming(r.list()?),
             _ => return Err("unknown body".into()),
         };
         Ok(Block { signed, body })
@@ -504,6 +512,54 @@ impl Wire for FinalityCert {
             height: r.u64()?,
             block: r.hash()?,
             votes: r.list()?,
+        })
+    }
+}
+
+impl Wire for BlobCommitment {
+    fn put(&self, w: &mut Writer) {
+        w.u32(self.len);
+        w.u32(self.k as u32);
+        w.fixed(&self.root);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        let len = r.u32()?;
+        let k = u16::try_from(r.u32()?).map_err(|_| "shard count out of range")?;
+        Ok(BlobCommitment { len, k, root: r.hash()? })
+    }
+}
+
+impl Wire for BlobTx {
+    fn put(&self, w: &mut Writer) {
+        self.base.put(w);
+        w.fixed(&self.namespace);
+        self.commitment.put(w);
+        w.bytes(&self.data);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        let base = Transfer::get(r)?;
+        let ns: [u8; 8] = (0..8).map(|_| r.u8()).collect::<Result<Vec<u8>, _>>()?.try_into().unwrap();
+        Ok(BlobTx { base, namespace: ns, commitment: BlobCommitment::get(r)?, data: r.bytes()? })
+    }
+}
+
+impl Wire for crate::hamming::InclusionProof {
+    fn put(&self, w: &mut Writer) {
+        self.header.put(w);
+        self.cert.put(w);
+        w.fixed(&self.prefix_hash);
+        self.commitment.put(w);
+        w.u32(self.tx_index);
+        w.list(&self.tx_branch);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok(crate::hamming::InclusionProof {
+            header: BlockHeader::get(r)?,
+            cert: FinalityCert::get(r)?,
+            prefix_hash: r.hash()?,
+            commitment: BlobCommitment::get(r)?,
+            tx_index: r.u32()?,
+            tx_branch: r.list()?,
         })
     }
 }
@@ -570,6 +626,7 @@ pub enum Tx {
     Kerckhoffs(KerckhoffsTx),
     Utxo(ChainId, AtbashTx),
     Feistel(FeistelTx),
+    Hamming(BlobTx),
 }
 
 impl Tx {
@@ -578,6 +635,7 @@ impl Tx {
             Tx::Kerckhoffs(_) => ChainId::Kerckhoffs,
             Tx::Utxo(c, _) => *c,
             Tx::Feistel(_) => ChainId::Feistel,
+            Tx::Hamming(_) => ChainId::Hamming,
         }
     }
     pub fn id(&self) -> Hash {
@@ -585,6 +643,7 @@ impl Tx {
             Tx::Kerckhoffs(t) => t.id(),
             Tx::Utxo(_, t) => t.id(),
             Tx::Feistel(t) => t.id(),
+            Tx::Hamming(t) => t.id(),
         }
     }
     /// Validate and apply to `l` (callers pass a clone to test).
@@ -593,6 +652,7 @@ impl Tx {
             Tx::Kerckhoffs(t) => l.apply_kerckhoffs(t),
             Tx::Utxo(c, t) => l.apply_utxo(*c, t),
             Tx::Feistel(t) => l.apply_feistel(t).map(|_| ()),
+            Tx::Hamming(t) => l.apply_blob(t),
         }
     }
 }
@@ -613,6 +673,10 @@ impl Wire for Tx {
                 w.u8(2);
                 t.put(w);
             }
+            Tx::Hamming(t) => {
+                w.u8(3);
+                t.put(w);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
@@ -620,6 +684,7 @@ impl Wire for Tx {
             0 => Ok(Tx::Kerckhoffs(KerckhoffsTx::get(r)?)),
             1 => Ok(Tx::Utxo(ChainId::get(r)?, AtbashTx::get(r)?)),
             2 => Ok(Tx::Feistel(FeistelTx::get(r)?)),
+            3 => Ok(Tx::Hamming(BlobTx::get(r)?)),
             _ => Err("unknown tx chain".into()),
         }
     }

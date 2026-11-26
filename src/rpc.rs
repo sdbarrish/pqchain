@@ -16,6 +16,10 @@
 //! GET  /hamming/blobs/{height}             blobs in a Hamming block
 //! GET  /hamming/proof/{height}/{index}     light-client inclusion proof (hex)
 //! GET  /hamming/shard/{height}/{index}/{i} one erasure-coded shard + Merkle path
+//! GET  /network                            this network's id and Kerckhoffs height
+//! GET  /bridge/set/{k_height}              validator set at a Kerckhoffs height (hex)
+//! GET  /bridge/kheader/{k_height}          certified Kerckhoffs header + resulting set (hex)
+//! GET  /bridge/outbox/{dest_network}       bridge messages to a network, with proofs (hex)
 //! POST /tx                          hex-encoded signed transaction
 
 use crate::codec::{Tx, Wire};
@@ -195,6 +199,40 @@ async fn hamming_shard(State(e): State<Shared>, Path((height, index, i)): Path<(
     Ok(Json(json!({ "shard": hex::encode(shard), "branch": branch.iter().map(hex::encode).collect::<Vec<_>>() })))
 }
 
+async fn network(State(e): State<Shared>) -> Json<Value> {
+    let e = e.lock().unwrap();
+    Json(json!({ "network_id": hex::encode(e.ledger.network_id), "kerckhoffs_height": e.ledger.tip(ChainId::Kerckhoffs).0 }))
+}
+
+fn list_hex<T: Wire>(v: &[T]) -> String {
+    let mut w = crate::codec::Writer::default();
+    w.list(v);
+    hex::encode(w.0)
+}
+
+async fn bridge_set(State(e): State<Shared>, Path(h): Path<u64>) -> Reply {
+    let e = e.lock().unwrap();
+    let set = e.ledger.validators_at(h).ok_or_else(|| not_found("no validator set at that height"))?;
+    Ok(Json(json!({ "validators": list_hex(&crate::playfair::from_ledger_set(set)) })))
+}
+
+async fn bridge_kheader(State(e): State<Shared>, Path(h): Path<u64>) -> Reply {
+    let e = e.lock().unwrap();
+    let (header, cert, set) = e.k_header(h).ok_or_else(|| not_found("no certified Kerckhoffs block at that height"))?;
+    Ok(Json(json!({ "header": hex::encode(header.to_bytes()), "cert": hex::encode(cert.to_bytes()), "validators": list_hex(&set) })))
+}
+
+async fn bridge_outbox(State(e): State<Shared>, Path(dest): Path<String>) -> Reply {
+    let d: crate::crypto::Hash = hex::decode(&dest).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| bad("network id must be 32-byte hex"))?;
+    let e = e.lock().unwrap();
+    let items: Vec<Value> = e
+        .bridge_outbox(&d)
+        .iter()
+        .map(|p| json!({ "amount": p.msg.amount, "recipient": p.msg.recipient.to_text(), "proof": hex::encode(p.to_bytes()) }))
+        .collect();
+    Ok(Json(json!(items)))
+}
+
 async fn zones(State(e): State<Shared>) -> Json<Value> {
     Json(e.lock().unwrap().status_json()["zones"].clone())
 }
@@ -225,6 +263,10 @@ pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
         .route("/hamming/blobs/{height}", get(hamming_blobs))
         .route("/hamming/proof/{height}/{index}", get(hamming_proof))
         .route("/hamming/shard/{height}/{index}/{i}", get(hamming_shard))
+        .route("/network", get(network))
+        .route("/bridge/set/{h}", get(bridge_set))
+        .route("/bridge/kheader/{h}", get(bridge_kheader))
+        .route("/bridge/outbox/{dest}", get(bridge_outbox))
         .route("/tx", post(submit))
         .with_state(engine);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("rpc {addr}: {e}"))?;

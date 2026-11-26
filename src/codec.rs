@@ -8,6 +8,7 @@ use crate::consensus::FinalityCert;
 use crate::crypto::*;
 use crate::feistel::{Action, FeistelTx};
 use crate::hamming::BlobCommitment;
+use crate::playfair::{BridgeMsg, BridgeProof, PlayfairKind};
 use crate::ledger::*;
 
 pub const MAX_BYTES: usize = 1 << 20; // any single byte string
@@ -168,6 +169,7 @@ impl Wire for ChainId {
             ChainId::Atbash => w.u8(1),
             ChainId::Feistel => w.u8(3),
             ChainId::Hamming => w.u8(4),
+            ChainId::Playfair => w.u8(5),
             ChainId::Zone(n) => {
                 w.u8(2);
                 w.u32(*n);
@@ -181,6 +183,7 @@ impl Wire for ChainId {
             2 => Ok(ChainId::Zone(r.u32()?)),
             3 => Ok(ChainId::Feistel),
             4 => Ok(ChainId::Hamming),
+            5 => Ok(ChainId::Playfair),
             _ => Err("unknown chain id".into()),
         }
     }
@@ -346,6 +349,7 @@ impl Wire for BlockHeader {
         w.u32(self.round);
         w.u64(self.anchor);
         w.fixed(&self.msg_root);
+        w.fixed(&self.set_root);
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
         Ok(BlockHeader {
@@ -358,6 +362,7 @@ impl Wire for BlockHeader {
             round: r.u32()?,
             anchor: r.u64()?,
             msg_root: r.hash()?,
+            set_root: r.hash()?,
         })
     }
 }
@@ -466,6 +471,10 @@ impl Wire for Block {
                 w.u8(3);
                 w.list(t);
             }
+            Body::Playfair(t) => {
+                w.u8(4);
+                w.list(t);
+            }
             Body::Kerckhoffs(t) => {
                 w.u8(0);
                 w.list(t);
@@ -483,6 +492,7 @@ impl Wire for Block {
             1 => Body::Atbash(r.list()?),
             2 => Body::Feistel(r.list()?),
             3 => Body::Hamming(r.list()?),
+            4 => Body::Playfair(r.list()?),
             _ => return Err("unknown body".into()),
         };
         Ok(Block { signed, body })
@@ -513,6 +523,114 @@ impl Wire for FinalityCert {
             block: r.hash()?,
             votes: r.list()?,
         })
+    }
+}
+
+impl Wire for (PublicKey, u64) {
+    fn put(&self, w: &mut Writer) {
+        self.0.put(w);
+        w.u64(self.1);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok((PublicKey::get(r)?, r.u64()?))
+    }
+}
+
+impl Wire for BridgeMsg {
+    fn put(&self, w: &mut Writer) {
+        w.fixed(&self.src_network);
+        w.fixed(&self.dest_network);
+        w.fixed(&self.txid);
+        self.recipient.put(w);
+        w.fixed(&self.origin);
+        w.u64(self.amount);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok(BridgeMsg {
+            src_network: r.hash()?,
+            dest_network: r.hash()?,
+            txid: r.hash()?,
+            recipient: Address::get(r)?,
+            origin: r.hash()?,
+            amount: r.u64()?,
+        })
+    }
+}
+
+impl Wire for BridgeProof {
+    fn put(&self, w: &mut Writer) {
+        self.msg.put(w);
+        self.header.put(w);
+        self.cert.put(w);
+        w.u32(self.leaf);
+        w.list(&self.branch);
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        Ok(BridgeProof {
+            msg: BridgeMsg::get(r)?,
+            header: BlockHeader::get(r)?,
+            cert: FinalityCert::get(r)?,
+            leaf: r.u32()?,
+            branch: r.list()?,
+        })
+    }
+}
+
+impl Wire for PlayfairTx {
+    fn put(&self, w: &mut Writer) {
+        self.base.put(w);
+        match &self.kind {
+            PlayfairKind::Transfer => w.u8(0),
+            PlayfairKind::Register { network_id, name, k_height, validators } => {
+                w.u8(1);
+                w.fixed(network_id);
+                w.bytes(name.as_bytes());
+                w.u64(*k_height);
+                w.list(validators);
+            }
+            PlayfairKind::Update { network_id, header, cert, validators } => {
+                w.u8(2);
+                w.fixed(network_id);
+                header.put(w);
+                cert.put(w);
+                w.list(validators);
+            }
+            PlayfairKind::Send { dest_network, recipient, origin, amount } => {
+                w.u8(3);
+                w.fixed(dest_network);
+                recipient.put(w);
+                w.fixed(origin);
+                w.u64(*amount);
+            }
+            PlayfairKind::Receive { proof } => {
+                w.u8(4);
+                proof.put(w);
+            }
+        }
+    }
+    fn get(r: &mut Reader) -> DecodeResult<Self> {
+        let base = Transfer::get(r)?;
+        let kind = match r.u8()? {
+            0 => PlayfairKind::Transfer,
+            1 => {
+                let network_id = r.hash()?;
+                let name = String::from_utf8(r.bytes()?).map_err(|_| "name not UTF-8")?;
+                if name.len() > 32 {
+                    return Err("counterparty name too long".into());
+                }
+                PlayfairKind::Register { network_id, name, k_height: r.u64()?, validators: r.list()? }
+            }
+            2 => PlayfairKind::Update {
+                network_id: r.hash()?,
+                header: BlockHeader::get(r)?,
+                cert: FinalityCert::get(r)?,
+                validators: r.list()?,
+            },
+            3 => PlayfairKind::Send { dest_network: r.hash()?, recipient: Address::get(r)?, origin: r.hash()?, amount: r.u64()? },
+            4 => PlayfairKind::Receive { proof: Box::new(BridgeProof::get(r)?) },
+            _ => return Err("unknown Playfair tx kind".into()),
+        };
+        Ok(PlayfairTx { base, kind })
     }
 }
 
@@ -627,6 +745,7 @@ pub enum Tx {
     Utxo(ChainId, AtbashTx),
     Feistel(FeistelTx),
     Hamming(BlobTx),
+    Playfair(PlayfairTx),
 }
 
 impl Tx {
@@ -636,6 +755,7 @@ impl Tx {
             Tx::Utxo(c, _) => *c,
             Tx::Feistel(_) => ChainId::Feistel,
             Tx::Hamming(_) => ChainId::Hamming,
+            Tx::Playfair(_) => ChainId::Playfair,
         }
     }
     pub fn id(&self) -> Hash {
@@ -644,6 +764,7 @@ impl Tx {
             Tx::Utxo(_, t) => t.id(),
             Tx::Feistel(t) => t.id(),
             Tx::Hamming(t) => t.id(),
+            Tx::Playfair(t) => t.id(),
         }
     }
     /// Validate and apply to `l` (callers pass a clone to test).
@@ -653,6 +774,7 @@ impl Tx {
             Tx::Utxo(c, t) => l.apply_utxo(*c, t),
             Tx::Feistel(t) => l.apply_feistel(t).map(|_| ()),
             Tx::Hamming(t) => l.apply_blob(t),
+            Tx::Playfair(t) => l.apply_playfair(t),
         }
     }
 }
@@ -677,6 +799,10 @@ impl Wire for Tx {
                 w.u8(3);
                 t.put(w);
             }
+            Tx::Playfair(t) => {
+                w.u8(4);
+                t.put(w);
+            }
         }
     }
     fn get(r: &mut Reader) -> DecodeResult<Self> {
@@ -685,6 +811,7 @@ impl Wire for Tx {
             1 => Ok(Tx::Utxo(ChainId::get(r)?, AtbashTx::get(r)?)),
             2 => Ok(Tx::Feistel(FeistelTx::get(r)?)),
             3 => Ok(Tx::Hamming(BlobTx::get(r)?)),
+            4 => Ok(Tx::Playfair(PlayfairTx::get(r)?)),
             _ => Err("unknown tx chain".into()),
         }
     }

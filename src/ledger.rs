@@ -9,6 +9,7 @@
 
 use crate::consensus::{FinalityCert, LightClient};
 use crate::hamming::{self, BlobCommitment};
+use crate::playfair::{self, BridgeMsg, Counterparty, PlayfairKind};
 use crate::feistel::{self, Action, FeistelState, FeistelTx, Receipt, BASE_FEE, MAX_FUEL};
 use crate::crypto::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +46,8 @@ pub enum ChainId {
     Feistel,
     /// Data-availability chain (erasure-coded blobs).
     Hamming,
+    /// Bridge chain (light clients of other PQ-Chain networks).
+    Playfair,
     /// Application chain registered on the Kerckhoffs Chain.
     Zone(u32),
 }
@@ -57,6 +60,7 @@ impl ChainId {
             ChainId::Atbash => 1,
             ChainId::Feistel => 2,
             ChainId::Hamming => 3,
+            ChainId::Playfair => 4,
             // Codes 3-15 are reserved for future primary chains (Hamming, Playfair).
             ChainId::Zone(n) => 16 + n as u64,
         }
@@ -67,6 +71,7 @@ impl ChainId {
             ChainId::Atbash => "Atbash Chain".into(),
             ChainId::Feistel => "Feistel Chain".into(),
             ChainId::Hamming => "Hamming Chain".into(),
+            ChainId::Playfair => "Playfair Chain".into(),
             ChainId::Zone(n) => format!("Zone {n}"),
         }
     }
@@ -81,6 +86,7 @@ impl ChainId {
             ChainId::Atbash => ctx::ATBASH_TX.to_vec(),
             ChainId::Feistel => ctx::FEISTEL_TX.to_vec(),
             ChainId::Hamming => ctx::HAMMING_TX.to_vec(),
+            ChainId::Playfair => ctx::PLAYFAIR_TX.to_vec(),
             ChainId::Zone(n) => format!("pqchain/v2/zone/{n}/tx").into_bytes(),
         }
     }
@@ -181,7 +187,7 @@ pub struct Transfer {
 
 impl Transfer {
     /// Signatures are excluded from the txid, so txids are not malleable.
-    fn encode(&self, e: &mut Enc) {
+    pub(crate) fn encode(&self, e: &mut Enc) {
         e.u64(self.inputs.len() as u64);
         for i in &self.inputs {
             e.bytes(&i.prev.txid)
@@ -316,6 +322,31 @@ impl BlobTx {
     }
 }
 
+/// Playfair Chain transaction (bridges).
+#[derive(Clone, Debug)]
+pub struct PlayfairTx {
+    pub base: Transfer,
+    pub kind: PlayfairKind,
+}
+
+impl PlayfairTx {
+    pub fn id(&self) -> Hash {
+        let mut e = Enc::new("pqchain/playfair-tx");
+        self.base.encode(&mut e);
+        self.kind.encode(&mut e);
+        e.hash()
+    }
+    pub fn sign(mut self, keys: &[&Keypair]) -> Self {
+        let id = self.id();
+        self.base.sign_all(ctx::PLAYFAIR_TX, &id, keys);
+        self
+    }
+    /// Unsigned, input-less transaction (Update and Receive are proven, not paid).
+    pub fn proven(kind: PlayfairKind) -> Self {
+        PlayfairTx { base: Transfer::default(), kind }
+    }
+}
+
 /// A signed block header: what a proposer commits to.
 #[derive(Clone, Debug)]
 pub struct SignedHeader {
@@ -443,6 +474,10 @@ pub struct BlockHeader {
     /// Kerckhoffs Chain height whose validator set governs this block. Makes
     /// validity independent of the order in which chains are accepted.
     pub anchor: u64,
+    /// Kerckhoffs blocks: hash of the active validator set after this block
+    /// (lets other networks' light clients follow validator changes).
+    /// Other chains: all zeros.
+    pub set_root: Hash,
     /// Merkle root of the relay messages this block emits.
     pub msg_root: Hash,
 }
@@ -459,6 +494,7 @@ impl BlockHeader {
             .u64(self.round as u64)
             .u64(self.anchor)
             .bytes(&self.msg_root)
+            .bytes(&self.set_root)
             .hash()
     }
 }
@@ -470,6 +506,7 @@ pub enum Body {
     Kerckhoffs(Vec<KerckhoffsTx>),
     Feistel(Vec<FeistelTx>),
     Hamming(Vec<BlobTx>),
+    Playfair(Vec<PlayfairTx>),
 }
 
 impl Body {
@@ -479,6 +516,7 @@ impl Body {
             Body::Kerckhoffs(t) => t.iter().map(KerckhoffsTx::id).collect(),
             Body::Feistel(t) => t.iter().map(FeistelTx::id).collect(),
             Body::Hamming(t) => t.iter().map(BlobTx::id).collect(),
+            Body::Playfair(t) => t.iter().map(PlayfairTx::id).collect(),
         }
     }
     pub fn len(&self) -> usize {
@@ -487,6 +525,7 @@ impl Body {
             Body::Kerckhoffs(t) => t.len(),
             Body::Feistel(t) => t.len(),
             Body::Hamming(t) => t.len(),
+            Body::Playfair(t) => t.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -610,6 +649,15 @@ pub struct Ledger {
     pub atbash_utxos: BTreeMap<OutPoint, TxOut>,
     pub kerckhoffs_utxos: BTreeMap<OutPoint, TxOut>,
     pub hamming_utxos: BTreeMap<OutPoint, TxOut>,
+    pub playfair_utxos: BTreeMap<OutPoint, TxOut>,
+    /// This network's id (from genesis); bridge messages are addressed by it.
+    pub network_id: Hash,
+    /// Light clients of other networks, by network id.
+    pub counterparties: BTreeMap<Hash, Counterparty>,
+    /// Native tokens escrowed for each counterparty network.
+    pub escrowed: BTreeMap<Hash, u64>,
+    /// Bridge messages already received: (source network, message hash).
+    pub bridge_received: BTreeSet<(Hash, Hash)>,
     /// (destination chain, outpoint) -> output waiting to be imported.
     pub atomic: BTreeMap<(ChainId, OutPoint), TxOut>,
     pub validators: ValidatorSet,
@@ -663,7 +711,7 @@ impl Ledger {
                 },
             );
         }
-        for c in [ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel, ChainId::Hamming] {
+        for c in [ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel, ChainId::Hamming, ChainId::Playfair] {
             l.tips.insert(c, (0, Enc::new("pqchain/genesis-block").u64(c.code()).hash()));
             l.anchors.insert(c, 0);
         }
@@ -678,7 +726,7 @@ impl Ledger {
 
     /// Every chain this ledger tracks: the two primary chains plus zones.
     pub fn chains(&self) -> Vec<ChainId> {
-        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel, ChainId::Hamming];
+        let mut v = vec![ChainId::Kerckhoffs, ChainId::Atbash, ChainId::Feistel, ChainId::Hamming, ChainId::Playfair];
         v.extend(self.zones.keys().map(|n| ChainId::Zone(*n)));
         v
     }
@@ -692,7 +740,9 @@ impl Ledger {
     pub fn chain_validators(&self, chain: ChainId, anchor: u64) -> Option<ValidatorSet> {
         let set = self.validators_at(anchor)?;
         match chain {
-            ChainId::Kerckhoffs | ChainId::Atbash | ChainId::Feistel | ChainId::Hamming => Some(set.clone()),
+            ChainId::Kerckhoffs | ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Playfair => {
+                Some(set.clone())
+            }
             ChainId::Zone(n) => {
                 let z = self.zones.get(&n)?;
                 if z.created_at > anchor {
@@ -750,12 +800,14 @@ impl Ledger {
             ChainId::Zone(n) => self.zone_utxos.get(&n).unwrap_or(&EMPTY_UTXOS),
             ChainId::Feistel => &EMPTY_UTXOS, // account-based
             ChainId::Hamming => &self.hamming_utxos,
+            ChainId::Playfair => &self.playfair_utxos,
         }
     }
     fn utxos_mut(&mut self, chain: ChainId) -> &mut BTreeMap<OutPoint, TxOut> {
         match chain {
             ChainId::Kerckhoffs => &mut self.kerckhoffs_utxos,
             ChainId::Hamming => &mut self.hamming_utxos,
+            ChainId::Playfair => &mut self.playfair_utxos,
             ChainId::Atbash => &mut self.atbash_utxos,
             ChainId::Zone(n) => self.zone_utxos.entry(n).or_default(),
             ChainId::Feistel => unreachable!("the Feistel Chain is account-based (apply_utxo rejects it)"),
@@ -882,10 +934,9 @@ impl Ledger {
                 if dest == ChainId::Feistel && chain != ChainId::Atbash {
                     return Err("the Feistel Chain is funded from the Atbash Chain only".into());
                 }
-                if (chain == ChainId::Hamming && dest != ChainId::Atbash)
-                    || (dest == ChainId::Hamming && chain != ChainId::Atbash)
-                {
-                    return Err("the Hamming Chain exchanges value with the Atbash Chain only".into());
+                let atbash_only = |c: ChainId| matches!(c, ChainId::Hamming | ChainId::Playfair);
+                if (atbash_only(chain) && dest != ChainId::Atbash) || (atbash_only(dest) && chain != ChainId::Atbash) {
+                    return Err("the Hamming and Playfair Chains exchange value with the Atbash Chain only".into());
                 }
                 if !self.knows(dest) {
                     return Err("export to an unknown chain".into());
@@ -996,6 +1047,105 @@ impl Ledger {
         Ok(receipt)
     }
 
+    /// Apply a Playfair (bridge) transaction.
+    pub fn apply_playfair(&mut self, tx: &PlayfairTx) -> Result<(), String> {
+        self.atomically(|l| l.apply_playfair_inner(tx))
+    }
+
+    fn apply_playfair_inner(&mut self, tx: &PlayfairTx) -> Result<(), String> {
+        let id = tx.id();
+        let ins = self.spend_inputs(ChainId::Playfair, &tx.base, &id, ctx::PLAYFAIR_TX)?;
+        let outs = self.create_outputs(ChainId::Playfair, &tx.base, &id)?;
+        let get = |m: &BTreeMap<AssetId, u128>, a: &AssetId| m.get(a).copied().unwrap_or(0);
+        // Which non-native asset (if any) this kind moves out, and how much native it locks.
+        let (moved, native_locked, fee) = match &tx.kind {
+            PlayfairKind::Transfer => (None, 0, TX_FEE),
+            PlayfairKind::Register { .. } => (None, 0, playfair::REGISTER_FEE),
+            PlayfairKind::Update { .. } | PlayfairKind::Receive { .. } => (None, 0, 0),
+            PlayfairKind::Send { origin, amount, .. } if *origin == self.network_id => (None, *amount, TX_FEE),
+            PlayfairKind::Send { origin, amount, .. } => (Some((playfair::wrapped_asset(origin), *amount)), 0, TX_FEE),
+        };
+        for asset in ins.keys().chain(outs.keys()).filter(|a| **a != NATIVE) {
+            let (i, o) = (get(&ins, asset), get(&outs, asset));
+            match moved {
+                Some((w, amount)) if w == *asset => {
+                    if i != o + amount as u128 {
+                        return Err("wrapped inputs must equal outputs + amount sent".into());
+                    }
+                }
+                _ if i != o => return Err("asset amounts not conserved".into()),
+                _ => {}
+            }
+        }
+        if let Some((w, amount)) = moved {
+            if get(&ins, &w) != get(&outs, &w) + amount as u128 {
+                return Err("wrapped inputs must equal outputs + amount sent".into());
+            }
+        }
+        let (n_in, n_out) = (get(&ins, &NATIVE), get(&outs, &NATIVE));
+        if n_in < n_out + native_locked as u128 + fee as u128 {
+            return Err("native inputs do not cover outputs + amount + fee".into());
+        }
+        self.burned += (n_in - n_out - native_locked as u128) as u64;
+
+        match &tx.kind {
+            PlayfairKind::Transfer => {}
+            PlayfairKind::Register { network_id, name, k_height, validators } => {
+                if *network_id == self.network_id || self.counterparties.contains_key(network_id) {
+                    return Err("network is this network or already registered".into());
+                }
+                if name.is_empty() || name.len() > 32 {
+                    return Err("counterparty name must be 1-32 bytes".into());
+                }
+                playfair::validate_set(validators)?;
+                let sets = BTreeMap::from([(*k_height, validators.clone())]);
+                self.counterparties.insert(*network_id, Counterparty { name: name.clone(), sets, tip: *k_height });
+            }
+            PlayfairKind::Update { network_id, header, cert, validators } => {
+                let cp = self.counterparties.get_mut(network_id).ok_or("unknown counterparty")?;
+                playfair::check_update(cp, header, cert, validators)?;
+                cp.sets.insert(header.height, validators.clone());
+                cp.tip = header.height;
+                while cp.sets.len() > playfair::KEEP_SETS {
+                    cp.sets.pop_first();
+                }
+            }
+            PlayfairKind::Send { dest_network, recipient, origin, amount } => {
+                if *amount == 0 || *recipient == Address([0; 32]) {
+                    return Err("send needs a positive amount and a recipient".into());
+                }
+                if !self.counterparties.contains_key(dest_network) {
+                    return Err("unknown destination network".into());
+                }
+                if *origin == self.network_id {
+                    *self.escrowed.entry(*dest_network).or_default() += amount;
+                } else if origin != dest_network {
+                    return Err("wrapped tokens can only return to their origin network".into());
+                }
+            }
+            PlayfairKind::Receive { proof } => {
+                let m = &proof.msg;
+                let cp = self.counterparties.get(&m.src_network).ok_or("unknown source network")?;
+                playfair::check_proof(cp, &self.network_id, proof)?;
+                if !self.bridge_received.insert((m.src_network, m.hash())) {
+                    return Err("bridge message already received (double-spend)".into());
+                }
+                let asset = if m.origin == self.network_id {
+                    let e = self.escrowed.get_mut(&m.src_network).filter(|e| **e >= m.amount);
+                    *e.ok_or("escrow for this network cannot cover the release")? -= m.amount;
+                    NATIVE
+                } else if m.origin == m.src_network {
+                    playfair::wrapped_asset(&m.origin)
+                } else {
+                    return Err("multi-hop transfers are not supported".into());
+                };
+                let op = OutPoint { txid: id, index: tx.base.n_outpoints() };
+                self.playfair_utxos.insert(op, TxOut { owner: m.recipient, asset, amount: m.amount });
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a Hamming blob transaction.
     pub fn apply_blob(&mut self, tx: &BlobTx) -> Result<(), String> {
         self.atomically(|l| l.apply_blob_inner(tx))
@@ -1032,7 +1182,7 @@ impl Ledger {
     }
 
     fn apply_utxo_inner(&mut self, chain: ChainId, tx: &AtbashTx) -> Result<(), String> {
-        if matches!(chain, ChainId::Kerckhoffs | ChainId::Feistel | ChainId::Hamming) || !self.knows(chain) {
+        if !matches!(chain, ChainId::Atbash | ChainId::Zone(_)) || !self.knows(chain) {
             return Err(format!("{} does not take UTXO transactions", chain.name()));
         }
         let id = tx.id();
@@ -1297,10 +1447,12 @@ impl Ledger {
             ChainId::Kerckhoffs if h.anchor != k_tip => {
                 return Err("Kerckhoffs block must anchor to its parent height".into())
             }
-            ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Zone(_) if h.anchor > k_tip => {
+            ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Playfair | ChainId::Zone(_)
+                if h.anchor > k_tip =>
+            {
                 return Err("anchor is ahead of the local Kerckhoffs tip (retry later)".into())
             }
-            ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Zone(_)
+            ChainId::Atbash | ChainId::Feistel | ChainId::Hamming | ChainId::Playfair | ChainId::Zone(_)
                 if h.anchor < self.anchors.get(&h.chain).copied().unwrap_or(0) =>
             {
                 return Err("anchor went backwards".into())
@@ -1330,7 +1482,7 @@ impl Ledger {
         if merkle_root(&b.body.tx_ids()) != h.tx_root {
             return Err("tx root mismatch".into());
         }
-        if msg_root(&b.messages()) != h.msg_root {
+        if header_msg_root(&self.network_id, h.chain, &b.body) != h.msg_root {
             return Err("relay message root mismatch".into());
         }
         match (&b.body, h.chain) {
@@ -1357,6 +1509,11 @@ impl Ledger {
                     self.apply_blob_inner(t).map_err(|e| format!("tx {i}: {e}"))?;
                 }
             }
+            (Body::Playfair(txs), ChainId::Playfair) => {
+                for (i, t) in txs.iter().enumerate() {
+                    self.apply_playfair_inner(t).map_err(|e| format!("tx {i}: {e}"))?;
+                }
+            }
             _ => return Err("body does not match chain".into()),
         }
         self.distribute_rewards(h.chain, h.anchor);
@@ -1364,7 +1521,12 @@ impl Ledger {
         self.anchors.insert(h.chain, h.anchor);
         if h.chain == ChainId::Kerckhoffs {
             self.release_unbonded(h.height);
+            if set_hash(&self.validators) != h.set_root {
+                return Err("validator set root mismatch".into());
+            }
             self.validator_history.insert(h.height, Arc::new(self.validators.clone()));
+        } else if h.set_root != [0; 32] {
+            return Err("only Kerckhoffs blocks carry a validator set root".into());
         }
         Ok(())
     }
@@ -1382,6 +1544,8 @@ impl Ledger {
         native(&self.atbash_utxos)
             + native(&self.kerckhoffs_utxos)
             + native(&self.hamming_utxos)
+            + native(&self.playfair_utxos)
+            + self.escrowed.values().map(|e| *e as u128).sum::<u128>()
             + self.zone_utxos.values().map(native).sum::<u128>()
             + self.atomic.values().filter(|o| o.asset == NATIVE).map(|o| o.amount as u128).sum::<u128>()
             + self.feistel.balances.values().map(|b| *b as u128).sum::<u128>()
@@ -1393,7 +1557,21 @@ impl Ledger {
     /// Commitment to the entire state; replicas must agree on this.
     pub fn state_root(&self) -> Hash {
         let mut e = Enc::new("pqchain/state");
-        for (c, m) in [(0u8, &self.atbash_utxos), (1, &self.kerckhoffs_utxos), (3, &self.hamming_utxos)] {
+        e.bytes(&self.network_id);
+        for (n, cp) in &self.counterparties {
+            e.bytes(n).bytes(cp.name.as_bytes()).u64(cp.tip).u64(cp.sets.len() as u64);
+            for (h, s) in &cp.sets {
+                e.u64(*h).bytes(&playfair::bridge_set_hash(s));
+            }
+        }
+        for (n, amt) in &self.escrowed {
+            e.bytes(n).u64(*amt);
+        }
+        e.u64(self.bridge_received.len() as u64);
+        for (n, m) in &self.bridge_received {
+            e.bytes(n).bytes(m);
+        }
+        for (c, m) in [(0u8, &self.atbash_utxos), (1, &self.kerckhoffs_utxos), (3, &self.hamming_utxos), (4, &self.playfair_utxos)] {
             e.u8(c).u64(m.len() as u64);
             for (p, o) in m {
                 e.bytes(&p.txid).u64(p.index as u64);
@@ -1452,8 +1630,62 @@ pub fn propose_round(ledger: &Ledger, key: &Keypair, body: Body, timestamp: u64,
         Body::Kerckhoffs(_) => ChainId::Kerckhoffs,
         Body::Feistel(_) => ChainId::Feistel,
         Body::Hamming(_) => ChainId::Hamming,
+        Body::Playfair(_) => ChainId::Playfair,
     };
     propose_on(ledger, key, chain, body, timestamp, round)
+}
+
+/// Hash of the active validators (weight > 0): (node id, signing key, weight)
+/// in node-id order. The same function is used by bridge light clients.
+pub fn set_hash_entries<'a>(entries: impl Iterator<Item = (Address, &'a PublicKey, u64)>) -> Hash {
+    let mut e = Enc::new("pqchain/validator-set");
+    for (a, k, w) in entries {
+        e.bytes(&a.0).u8(k.alg).bytes(&k.bytes).u64(w);
+    }
+    e.hash()
+}
+
+pub fn set_hash(set: &ValidatorSet) -> Hash {
+    set_hash_entries(set.values().filter(|v| v.weight() > 0).map(|v| (v.node_id, &v.signing_key, v.weight())))
+}
+
+/// Validator-set root a Kerckhoffs block at `height` with `body` will produce.
+fn next_set_root(ledger: &Ledger, body: &Body, height: u64) -> Hash {
+    let mut l = ledger.clone();
+    if let Body::Kerckhoffs(txs) = body {
+        for t in txs {
+            let _ = l.apply_kerckhoffs_inner(t);
+        }
+    }
+    l.release_unbonded(height);
+    set_hash(&l.validators)
+}
+
+/// Message root committed in a block header (relay messages; bridge
+/// messages on the Playfair Chain).
+pub fn header_msg_root(network_id: &Hash, chain: ChainId, body: &Body) -> Hash {
+    match body {
+        Body::Playfair(_) => merkle_root(&bridge_messages(network_id, body).iter().map(BridgeMsg::hash).collect::<Vec<_>>()),
+        _ => msg_root(&body_messages(chain, body)),
+    }
+}
+
+/// Bridge messages emitted by a Playfair block, in order.
+pub fn bridge_messages(network_id: &Hash, body: &Body) -> Vec<BridgeMsg> {
+    let Body::Playfair(txs) = body else { return Vec::new() };
+    txs.iter()
+        .filter_map(|t| match &t.kind {
+            PlayfairKind::Send { dest_network, recipient, origin, amount } => Some(BridgeMsg {
+                src_network: *network_id,
+                dest_network: *dest_network,
+                txid: t.id(),
+                recipient: *recipient,
+                origin: *origin,
+                amount: *amount,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build and sign a block for any chain (zones use an Atbash-style body).
@@ -1468,7 +1700,8 @@ pub fn propose_on(ledger: &Ledger, key: &Keypair, chain: ChainId, body: Body, ti
         timestamp,
         round,
         anchor: ledger.current_anchor(),
-        msg_root: msg_root(&body_messages(chain, &body)),
+        msg_root: header_msg_root(&ledger.network_id, chain, &body),
+        set_root: if chain == ChainId::Kerckhoffs { next_set_root(ledger, &body, h + 1) } else { [0; 32] },
     };
     let sig = key.sign(ctx::BLOCK, &header.hash());
     Block { signed: SignedHeader { header, sig }, body }

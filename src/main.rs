@@ -228,6 +228,41 @@ enum WalletCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Playfair bridge: start tracking another network (pays the registration fee).
+    BridgeRegister {
+        #[arg(long)]
+        key: PathBuf,
+        /// RPC of a node on the other network.
+        #[arg(long)]
+        remote: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Playfair bridge: bring this network's light client of `remote` up to date.
+    BridgeSync {
+        #[arg(long)]
+        remote: String,
+    },
+    /// Playfair bridge: send tokens to another network.
+    BridgeSend {
+        #[arg(long)]
+        key: PathBuf,
+        /// Destination network id (hex).
+        #[arg(long)]
+        dest_network: String,
+        #[arg(long)]
+        recipient: String,
+        #[arg(long)]
+        amount: u64,
+        /// Send tokens wrapped from this origin network back home (hex).
+        #[arg(long)]
+        wrapped_origin: Option<String>,
+    },
+    /// Playfair bridge: deliver messages `remote` sent to this network.
+    BridgeRelay {
+        #[arg(long)]
+        remote: String,
+    },
     /// Start a validator's exit (signed by its cold withdrawal key).
     Exit {
         /// Withdrawal key file of the validator.
@@ -417,6 +452,36 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
             let (data, used) = wallet::hamming_get(&c, height, index)?;
             std::fs::write(&out, &data).map_err(|e| e.to_string())?;
             println!("rebuilt {} bytes from shards {used:?} -> {}", data.len(), out.display());
+        }
+        WalletCmd::BridgeRegister { key, remote, name } => {
+            let k = node::load_key(&key)?;
+            let (tx, rid) = wallet::bridge_register(&c, &Client::new(&remote), &k, &name)?;
+            println!("registering network {} as '{name}'", hex::encode(rid));
+            submit(&c, tx)?;
+        }
+        WalletCmd::BridgeSync { remote } => {
+            let txs = wallet::bridge_sync(&c, &Client::new(&remote))?;
+            println!("{} light-client update(s)", txs.len());
+            for tx in txs {
+                submit(&c, tx)?;
+            }
+        }
+        WalletCmd::BridgeSend { key, dest_network, recipient, amount, wrapped_origin } => {
+            let k = node::load_key(&key)?;
+            let h = |s: &str| -> Result<[u8; 32], String> {
+                hex::decode(s).ok().and_then(|b| b.try_into().ok()).ok_or("expected 32-byte hex".into())
+            };
+            let origin = wrapped_origin.as_deref().map(h).transpose()?;
+            submit(&c, wallet::bridge_send(&c, &k, h(&dest_network)?, Address::from_text(&recipient)?, amount, origin)?)?;
+        }
+        WalletCmd::BridgeRelay { remote } => {
+            for (tx, amount) in wallet::bridge_relay(&c, &Client::new(&remote))? {
+                match c.submit(&tx) {
+                    Ok(r) => println!("delivered {amount}: tx {}", r["txid"].as_str().unwrap_or("?")),
+                    Err(e) if e.contains("already received") => {}
+                    Err(e) => println!("skipped: {e}"),
+                }
+            }
         }
         WalletCmd::Exit { withdrawal_key, node } => {
             let k = node::load_key(&withdrawal_key)?;

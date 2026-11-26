@@ -10,7 +10,7 @@ Each chain is named after a piece of cryptographic history:
 | **Atbash Chain** | UTXO payments and user-created assets | Atbash, one of the oldest known ciphers, for the chain that carries the most basic use: moving value |
 | **Feistel Chain** | WebAssembly smart contracts with post-quantum accounts | Feistel networks, which build complex ciphers from simple, composable rounds, as contracts compose |
 | **Hamming Chain** | Hash-based data availability for rollups and zones | Hamming codes, the first error-correcting codes; data availability relies on erasure coding |
-| **Playfair Chain** *(planned)* | Bridges to other networks | The Playfair cipher, which works on pairs of letters, as a bridge links pairs of chains |
+| **Playfair Chain** | Trust-minimized bridges to other PQ-Chain networks (on-chain light clients) | The Playfair cipher, which works on pairs of letters, as a bridge links pairs of chains |
 | **Zones** | Application chains validated by a chosen subset of primary validators | |
 
 > **Prototype.** Not audited and not for real value.
@@ -74,6 +74,29 @@ pqchain wallet hamming-get --height 2 --out rebuilt.bin    # rebuild from a rand
 ```
 
 Limits: the light client takes the validator set from one node as a checkpoint (a production client would follow Kerckhoffs Chain certificates from genesis); nodes keep all blobs (no pruning yet); there is no fraud-proof path for nodes that only sample.
+
+## Playfair Chain (bridges)
+
+Each network's Playfair Chain runs an **on-chain light client** of every registered counterparty network. Funds move on cryptographic proof, with no multisig custodian.
+
+| Piece | Implementation |
+|---|---|
+| Validator-set commitments | Every Kerckhoffs block header carries `set_root`, the hash of the validator set the block produces; every node verifies it. |
+| Tracking | `Update` applies the counterparty's next Kerckhoffs header. It is accepted only with a > 2/3 certificate from the set already tracked, and the new list must match `set_root`. |
+| Send | Native tokens are escrowed per destination network; wrapped tokens going home are burned. The message is committed in the block's `msg_root`. |
+| Receive | Source header + finality certificate (checked against the tracked set at the header's anchor) + Merkle path. Mints wrapped tokens or releases escrow; each message is received once. |
+| Damage limits | Escrow is per counterparty, so a compromised network can release at most what was sent to it. No multi-hop: wrapped tokens only return to their origin. |
+| Trust anchor | Registration (fee 100) records the counterparty's validator set at one height. Check the network id out of band, like a light-client checkpoint. |
+
+```bash
+pqchain wallet --rpc $A bridge-register --key payer.key --remote $B --name network-b
+pqchain wallet --rpc $A bridge-sync --remote $B                     # relayer: light-client updates
+pqchain wallet --rpc $A bridge-send --key alice.key --dest-network <B id> --recipient <bob> --amount 1000
+pqchain wallet --rpc $B bridge-relay --remote $A                    # relayer: deliver with proofs
+scripts/bridge-testnet.sh                                           # two live networks end to end
+```
+
+Not supported yet: bridges to non-PQ-Chain networks (Bitcoin, Ethereum), skipping light-client updates (every Kerckhoffs header is applied in order), and token types other than each network's native token.
 
 ## Hardening (v3)
 
@@ -179,7 +202,8 @@ Wallets sign locally; only signed transactions are sent to a node (`--rpc http:/
 - **v2 remaining**: STARK-aggregated finality certificates (one ~100 KB proof instead of N × 3.3 KB signatures), zones (app chains), relay messages between chains, SLH-DSA cold keys
 - **v3 hardening (done)**: fuzzing (4 targets, 2 bugs fixed), Kani proofs, atomic transaction application
 - **v3 Hamming Chain (done)**: erasure-coded blobs, hash-based commitments, light-client sampling
-- **v3 remaining**: Playfair Chain bridges, external audits
+- **v3 Playfair Chain (done)**: on-chain light clients, escrow and wrapped tokens, validator-set roots in headers
+- **Remaining before any real value**: external security audit, bridges to external networks, light-client update skipping, blob pruning
 
 ## Credits
 

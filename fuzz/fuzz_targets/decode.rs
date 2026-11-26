@@ -6,7 +6,8 @@ use pqchain::codec::{Tx, Wire};
 use pqchain::consensus::FinalityCert;
 use pqchain::feistel::FeistelTx;
 use pqchain::hamming::InclusionProof;
-use pqchain::ledger::{BlobTx, Block, RelayIn};
+use pqchain::ledger::{BlobTx, Block, PlayfairTx, RelayIn};
+use pqchain::playfair::BridgeProof;
 use pqchain::node::Msg;
 
 fn check<T: Wire>(data: &[u8]) {
@@ -17,7 +18,9 @@ fn check<T: Wire>(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     let Some((&kind, rest)) = data.split_first() else { return };
-    match kind % 8 {
+    match kind % 10 {
+        8 => check::<PlayfairTx>(rest),
+        9 => check::<BridgeProof>(rest),
         0 => check::<Msg>(rest),
         1 => check::<Block>(rest),
         2 => check::<Tx>(rest),

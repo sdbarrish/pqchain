@@ -70,6 +70,7 @@ fn native_only(v: Vec<(OutPoint, TxOut)>) -> Vec<(OutPoint, TxOut)> {
 fn wrap(chain: ChainId, base: Transfer, kind: KerckhoffsKind, n: usize, key: &Keypair) -> Tx {
     match chain {
         ChainId::Kerckhoffs => Tx::Kerckhoffs(KerckhoffsTx { base, kind }.sign(&vec![key; n])),
+        ChainId::Playfair => Tx::Playfair(PlayfairTx { base, kind: crate::playfair::PlayfairKind::Transfer }.sign(&vec![key; n])),
         ChainId::Hamming => Tx::Hamming(BlobTx::new(base, [0; 8], Vec::new()).sign(&vec![key; n])),
         _ => Tx::Utxo(chain, AtbashTx { base, create_asset: None }.sign_for(chain, &vec![key; n])),
     }
@@ -94,6 +95,115 @@ pub fn feistel_import(c: &Client, key: &Keypair) -> Result<(Tx, u64), String> {
     }
     let outpoints = pool.into_iter().map(|(p, _)| p).take(256).collect();
     Ok((feistel(c, key, 0, crate::feistel::Action::Import { outpoints })?, total))
+}
+
+fn hex32(v: &Value) -> Result<Hash, String> {
+    hex::decode(v.as_str().ok_or("missing hash")?).ok().and_then(|b| b.try_into().ok()).ok_or("expected 32-byte hex".into())
+}
+
+fn from_hex<T: Wire>(v: &Value) -> Result<T, String> {
+    T::from_bytes(&hex::decode(v.as_str().ok_or("missing field")?).map_err(|e| e.to_string())?)
+}
+
+fn list_from_hex<T: Wire>(v: &Value) -> Result<Vec<T>, String> {
+    let b = hex::decode(v.as_str().ok_or("missing field")?).map_err(|e| e.to_string())?;
+    let mut r = crate::codec::Reader::new(&b);
+    let l = r.list()?;
+    r.finish()?;
+    Ok(l)
+}
+
+pub fn network_id(c: &Client) -> Result<(Hash, u64), String> {
+    let v = c.get("/network")?;
+    Ok((hex32(&v["network_id"])?, v["kerckhoffs_height"].as_u64().ok_or("unexpected RPC reply")?))
+}
+
+/// Register `remote` as a counterparty on `local` (start tracking its
+/// validator set at its current Kerckhoffs height). This first set is the
+/// trust anchor: check the network id out of band.
+pub fn bridge_register(local: &Client, remote: &Client, key: &Keypair, name: &str) -> Result<(Tx, Hash), String> {
+    let (rid, k) = network_id(remote)?;
+    let validators = list_from_hex(&remote.get(&format!("/bridge/set/{k}"))?["validators"])?;
+    let pool = native_only(local.utxos(ChainId::Playfair, &key.address())?);
+    let (base, n) = native_transfer_from_pool(pool, Source::Local, key, vec![], None, crate::playfair::REGISTER_FEE - TX_FEE)?;
+    let kind = crate::playfair::PlayfairKind::Register { network_id: rid, name: name.into(), k_height: k, validators };
+    Ok((Tx::Playfair(PlayfairTx { base, kind }.sign(&vec![key; n])), rid))
+}
+
+/// Light-client updates bringing `local`'s view of `remote` up to date
+/// (one per certified Kerckhoffs block, in order).
+pub fn bridge_sync(local: &Client, remote: &Client) -> Result<Vec<Tx>, String> {
+    let (rid, remote_tip) = network_id(remote)?;
+    let status = local.get("/status")?;
+    let cp = status["counterparties"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["network_id"].as_str() == Some(hex::encode(rid).as_str())).cloned())
+        .ok_or("remote network is not registered here")?;
+    let mut txs = Vec::new();
+    for h in cp["tracked_kerckhoffs_height"].as_u64().unwrap_or(0) + 1..=remote_tip {
+        let Ok(v) = remote.get(&format!("/bridge/kheader/{h}")) else { break }; // not certified yet
+        txs.push(Tx::Playfair(PlayfairTx::proven(crate::playfair::PlayfairKind::Update {
+            network_id: rid,
+            header: from_hex(&v["header"])?,
+            cert: from_hex(&v["cert"])?,
+            validators: list_from_hex(&v["validators"])?,
+        })));
+    }
+    Ok(txs)
+}
+
+/// Send `amount` to `recipient` on `dest`. Native tokens are escrowed;
+/// tokens wrapped from `wrapped_origin` are burned (they must be going home).
+pub fn bridge_send(c: &Client, key: &Keypair, dest: Hash, recipient: Address, amount: u64, wrapped_origin: Option<Hash>) -> Result<Tx, String> {
+    let (self_id, _) = network_id(c)?;
+    let utxos = c.utxos(ChainId::Playfair, &key.address())?;
+    let kind = |origin| crate::playfair::PlayfairKind::Send { dest_network: dest, recipient, origin, amount };
+    let (base, n) = match wrapped_origin {
+        None => {
+            let (b, n) = native_transfer_from_pool(native_only(utxos), Source::Local, key, vec![], None, amount)?;
+            return Ok(Tx::Playfair(PlayfairTx { base: b, kind: kind(self_id) }.sign(&vec![key; n])));
+        }
+        Some(origin) => {
+            let w = crate::playfair::wrapped_asset(&origin);
+            let (mut picked, mut have_w, mut have_n) = (Vec::new(), 0u64, 0u64);
+            for (p, o) in &utxos {
+                if (o.asset == w && have_w < amount) || (o.asset == NATIVE && have_n < TX_FEE) {
+                    picked.push(*p);
+                    if o.asset == w { have_w += o.amount } else { have_n += o.amount }
+                }
+            }
+            if have_w < amount || have_n < TX_FEE {
+                return Err(format!("need {amount} wrapped + {TX_FEE} native; have {have_w} + {have_n}"));
+            }
+            let mut outs = Vec::new();
+            if have_w > amount {
+                outs.push(TxOut { owner: key.address(), asset: w, amount: have_w - amount });
+            }
+            if have_n > TX_FEE {
+                outs.push(TxOut::native(key.address(), have_n - TX_FEE));
+            }
+            let spends: Vec<_> = picked.iter().map(|p| (*p, Source::Local, key)).collect();
+            (Transfer::spend(&spends, outs), spends.len())
+        }
+    };
+    let origin = wrapped_origin.unwrap();
+    Ok(Tx::Playfair(PlayfairTx { base, kind: kind(origin) }.sign(&vec![key; n])))
+}
+
+/// Receive transactions for every message `remote` sent to `local`'s network
+/// (already-received ones are rejected by the chain and skipped).
+pub fn bridge_relay(local: &Client, remote: &Client) -> Result<Vec<(Tx, u64)>, String> {
+    let (self_id, _) = network_id(local)?;
+    let v = remote.get(&format!("/bridge/outbox/{}", hex::encode(self_id)))?;
+    v.as_array()
+        .ok_or("unexpected RPC reply")?
+        .iter()
+        .map(|i| {
+            let proof: crate::playfair::BridgeProof = from_hex(&i["proof"])?;
+            let amount = proof.msg.amount;
+            Ok((Tx::Playfair(PlayfairTx::proven(crate::playfair::PlayfairKind::Receive { proof: Box::new(proof) })), amount))
+        })
+        .collect()
 }
 
 /// Post a blob to the Hamming Chain (fee paid from Hamming Chain funds).

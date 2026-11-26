@@ -48,6 +48,7 @@ pub fn chain_from_str(s: &str) -> Result<ChainId, String> {
         "atbash" | "a" => Ok(ChainId::Atbash),
         "feistel" | "f" => Ok(ChainId::Feistel),
         "hamming" | "h" => Ok(ChainId::Hamming),
+        "playfair" | "p" => Ok(ChainId::Playfair),
         _ => s
             .strip_prefix("zone-")
             .or_else(|| s.strip_prefix("zone:"))
@@ -63,6 +64,7 @@ pub fn chain_slug(c: ChainId) -> String {
         ChainId::Atbash => "atbash".into(),
         ChainId::Feistel => "feistel".into(),
         ChainId::Hamming => "hamming".into(),
+        ChainId::Playfair => "playfair".into(),
         ChainId::Zone(n) => format!("zone-{n}"),
     }
 }
@@ -498,7 +500,7 @@ impl Engine {
         let n = records.len() as u64;
         let mut skip = 0u64;
         match crate::snapshot::load(&e.store.dir) {
-            Ok(Some((ledger, covered))) if covered <= n => {
+            Ok(Some((ledger, covered))) if covered <= n && ledger.network_id == e.ledger.network_id => {
                 e.ledger = ledger;
                 skip = covered;
                 e.last_snapshot = covered;
@@ -933,6 +935,9 @@ impl Engine {
                 ChainId::Feistel => Body::Feistel(
                     picked.into_iter().filter_map(|t| if let Tx::Feistel(t) = t { Some(t) } else { None }).collect(),
                 ),
+                ChainId::Playfair => Body::Playfair(
+                    picked.into_iter().filter_map(|t| if let Tx::Playfair(t) = t { Some(t) } else { None }).collect(),
+                ),
                 ChainId::Hamming => {
                     let mut room = crate::hamming::MAX_BLOCK_DATA;
                     Body::Hamming(
@@ -1108,6 +1113,12 @@ impl Engine {
             "atbash": chain(ChainId::Atbash),
             "feistel": chain(ChainId::Feistel),
             "hamming": chain(ChainId::Hamming),
+            "playfair": chain(ChainId::Playfair),
+            "network_id": hex::encode(self.ledger.network_id),
+            "counterparties": self.ledger.counterparties.iter().map(|(n, cp)| serde_json::json!({
+                "network_id": hex::encode(n), "name": cp.name, "tracked_kerckhoffs_height": cp.tip,
+                "escrowed": self.ledger.escrowed.get(n).copied().unwrap_or(0),
+            })).collect::<Vec<_>>(),
             "contracts": self.ledger.feistel.contracts.len(),
             "zones": zones,
             "mempool": self.mempool.len(),
@@ -1116,6 +1127,33 @@ impl Engine {
             "burned": self.ledger.burned,
             "minted": self.ledger.minted,
         })
+    }
+
+    /// Certified Kerckhoffs header at `h` with the validator set it produces.
+    pub fn k_header(&self, h: u64) -> Option<(BlockHeader, FinalityCert, crate::playfair::BridgeValidators)> {
+        let (b, cert) = self.accepted.get(&(ChainId::Kerckhoffs, h))?;
+        let set = self.ledger.validator_history.get(&h)?;
+        Some((b.header().clone(), cert.clone()?, crate::playfair::from_ledger_set(set)))
+    }
+
+    /// Proofs for every bridge message this network sent to `dest`.
+    pub fn bridge_outbox(&self, dest: &Hash) -> Vec<crate::playfair::BridgeProof> {
+        let mut out = Vec::new();
+        for ((c, _), (b, cert)) in &self.accepted {
+            let (ChainId::Playfair, Some(cert)) = (c, cert) else { continue };
+            let msgs = bridge_messages(&self.ledger.network_id, &b.body);
+            let hashes: Vec<Hash> = msgs.iter().map(|m| m.hash()).collect();
+            for (i, m) in msgs.iter().enumerate().filter(|(_, m)| &m.dest_network == dest) {
+                out.push(crate::playfair::BridgeProof {
+                    msg: m.clone(),
+                    header: b.header().clone(),
+                    cert: cert.clone(),
+                    leaf: i as u32,
+                    branch: merkle_branch(&hashes, i),
+                });
+            }
+        }
+        out
     }
 
     /// A posted blob: its block, the block's certificate (if formed) and the tx.
@@ -1245,10 +1283,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let network_id = genesis.network_id()?;
     let (store, records) = Store::open(&resolve(&base, &cfg.data_dir))?;
+    let mut genesis_ledger = genesis.ledger()?;
+    genesis_ledger.network_id = network_id;
     let engine: Shared = Arc::new(Mutex::new(Engine::new(
         cfg.name.clone(),
         load_key(&key_path)?,
-        genesis.ledger()?,
+        genesis_ledger,
         store,
         records,
     )?));

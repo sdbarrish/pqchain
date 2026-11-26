@@ -122,6 +122,29 @@ pub fn encode(l: &Ledger, records: u64) -> Vec<u8> {
     put_utxos(&mut w, &l.atbash_utxos);
     put_utxos(&mut w, &l.kerckhoffs_utxos);
     put_utxos(&mut w, &l.hamming_utxos);
+    put_utxos(&mut w, &l.playfair_utxos);
+    w.fixed(&l.network_id);
+    w.u64(l.counterparties.len() as u64);
+    for (n, cp) in &l.counterparties {
+        w.fixed(n);
+        cp.name.put(&mut w);
+        w.u64(cp.tip);
+        w.u64(cp.sets.len() as u64);
+        for (h, s) in &cp.sets {
+            w.u64(*h);
+            w.list(s);
+        }
+    }
+    w.u64(l.escrowed.len() as u64);
+    for (n, e) in &l.escrowed {
+        w.fixed(n);
+        w.u64(*e);
+    }
+    w.u64(l.bridge_received.len() as u64);
+    for (n, m) in &l.bridge_received {
+        w.fixed(n);
+        w.fixed(m);
+    }
     w.u64(l.atomic.len() as u64);
     for ((c, p), o) in &l.atomic {
         c.put(&mut w);
@@ -189,7 +212,29 @@ pub fn encode(l: &Ledger, records: u64) -> Vec<u8> {
 pub fn decode(b: &[u8]) -> DecodeResult<(Ledger, u64)> {
     let mut r = Reader::new(b);
     let records = r.u64()?;
-    let mut l = Ledger { atbash_utxos: get_utxos(&mut r)?, kerckhoffs_utxos: get_utxos(&mut r)?, hamming_utxos: get_utxos(&mut r)?, ..Default::default() };
+    let mut l = Ledger { atbash_utxos: get_utxos(&mut r)?, kerckhoffs_utxos: get_utxos(&mut r)?, hamming_utxos: get_utxos(&mut r)?, playfair_utxos: get_utxos(&mut r)?, ..Default::default() };
+    l.network_id = r.hash()?;
+    let mut prev = None;
+    for _ in 0..count(&mut r)? {
+        let n = ordered(&mut prev, r.hash()?)?;
+        let name = String::get(&mut r)?;
+        let tip = r.u64()?;
+        let (mut sets, mut prev_h) = (BTreeMap::new(), None);
+        for _ in 0..count(&mut r)? {
+            let h = ordered(&mut prev_h, r.u64()?)?;
+            sets.insert(h, r.list()?);
+        }
+        l.counterparties.insert(n, crate::playfair::Counterparty { name, sets, tip });
+    }
+    let mut prev = None;
+    for _ in 0..count(&mut r)? {
+        let n = ordered(&mut prev, r.hash()?)?;
+        l.escrowed.insert(n, r.u64()?);
+    }
+    let mut prev = None;
+    for _ in 0..count(&mut r)? {
+        l.bridge_received.insert(ordered(&mut prev, (r.hash()?, r.hash()?))?);
+    }
     let mut prev = None;
     for _ in 0..count(&mut r)? {
         let k = ordered(&mut prev, (ChainId::get(&mut r)?, OutPoint::get(&mut r)?))?;

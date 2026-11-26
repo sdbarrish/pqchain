@@ -15,6 +15,7 @@ pub mod feistel;
 pub mod hamming;
 pub mod ledger;
 pub mod network;
+pub mod playfair;
 pub mod node;
 pub mod rpc;
 pub mod snapshot;

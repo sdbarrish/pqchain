@@ -218,16 +218,24 @@ impl LightClient {
     }
 
     pub fn verify(&self, cert: &FinalityCert) -> Result<u64, String> {
+        self.verify_signed(ctx::VOTE, &vote_msg(cert.chain, cert.height, &cert.block), &cert.votes)
+    }
+
+    /// Generic > 2/3-of-stake check: distinct known validators signing `msg`
+    /// under `context`. Returns the percentage of stake that signed.
+    pub fn verify_signed(&self, context: &[u8], msg: &Hash, votes: &[(Address, Signature)]) -> Result<u64, String> {
         let total: u64 = self.validators.values().map(|(_, w)| w).sum();
-        let msg = vote_msg(cert.chain, cert.height, &cert.block);
+        if total == 0 {
+            return Err("empty validator set".into());
+        }
         let mut seen = BTreeSet::new();
         let mut signed = 0u64;
-        for (who, sig) in &cert.votes {
+        for (who, sig) in votes {
             let (pk, w) = self.validators.get(who).ok_or("vote from unknown validator")?;
             if !seen.insert(*who) {
                 return Err("duplicate vote".into());
             }
-            if !pk.verify(ctx::VOTE, &msg, sig) {
+            if !pk.verify(context, msg, sig) {
                 return Err("invalid vote signature".into());
             }
             signed += w;

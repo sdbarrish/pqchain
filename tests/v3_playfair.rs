@@ -71,9 +71,32 @@ fn register(local: &mut Net, remote: &Net) {
     let k = remote.l.current_anchor();
     let validators = from_ledger_set(remote.l.validators_at(k).unwrap());
     let (base, n) = native_transfer(&local.l, ChainId::Playfair, Source::Local, &local.user, vec![], None, REGISTER_FEE - TX_FEE).unwrap();
-    let kind = PlayfairKind::Register { network_id: remote.l.network_id, name: "peer".into(), k_height: k, validators };
+    let digest = registration_digest(&remote.l.network_id, "peer", k, &validators);
+    let approvals = local.vals[..3].iter().map(|v| approve_registration(v, &digest)).collect();
+    let kind = PlayfairKind::Register { network_id: remote.l.network_id, name: "peer".into(), k_height: k, validators, approvals };
     let tx = PlayfairTx { base, kind }.sign(&vec![&local.user; n]);
     local.pf(vec![tx]);
+}
+
+/// B1 regression: a registration is a trust anchor, so it needs > 2/3 of the
+/// local validators' stake, not just a fee.
+#[test]
+fn registration_requires_local_validator_approval() {
+    let (a, b) = (net(8), net(9));
+    let k = b.l.current_anchor();
+    let validators = from_ledger_set(b.l.validators_at(k).unwrap());
+    let digest = registration_digest(&b.l.network_id, "peer", k, &validators);
+    let attempt = |approvers: &[&Keypair], name: &str| {
+        let (base, n) = native_transfer(&a.l, ChainId::Playfair, Source::Local, &a.user, vec![], None, REGISTER_FEE - TX_FEE).unwrap();
+        let approvals = approvers.iter().map(|v| approve_registration(v, &digest)).collect();
+        let kind = PlayfairKind::Register { network_id: b.l.network_id, name: name.into(), k_height: k, validators: validators.clone(), approvals };
+        a.l.clone().apply_playfair(&PlayfairTx { base, kind }.sign(&vec![&a.user; n]))
+    };
+    assert!(attempt(&[], "peer").unwrap_err().contains("approvals"), "fee alone is not enough");
+    assert!(attempt(&[&a.vals[0], &a.vals[1]], "peer").is_err(), "50% of stake is not enough");
+    assert!(attempt(&[&b.vals[0], &b.vals[1], &b.vals[2]], "peer").is_err(), "the other network's validators do not count");
+    assert!(attempt(&[&a.vals[0], &a.vals[1], &a.vals[2]], "other-name").is_err(), "approvals bind the exact registration");
+    attempt(&[&a.vals[0], &a.vals[1], &a.vals[2]], "peer").unwrap();
 }
 
 fn update(remote: &Net, b: &Block, signers: &[usize]) -> PlayfairTx {
@@ -183,6 +206,9 @@ fn rules_on_routing_and_sync() {
     assert!(a.l.clone().apply_playfair(&unknown).unwrap_err().contains("unknown destination"));
     // Self-registration is refused.
     let (base, n) = native_transfer(&a.l, ChainId::Playfair, Source::Local, &a.user, vec![], None, REGISTER_FEE - TX_FEE).unwrap();
-    let kind = PlayfairKind::Register { network_id: a.l.network_id, name: "me".into(), k_height: 0, validators: from_ledger_set(&a.l.validators) };
+    let own = from_ledger_set(&a.l.validators);
+    let digest = registration_digest(&a.l.network_id, "me", 0, &own);
+    let approvals = a.vals[..3].iter().map(|v| approve_registration(v, &digest)).collect();
+    let kind = PlayfairKind::Register { network_id: a.l.network_id, name: "me".into(), k_height: 0, validators: own, approvals };
     assert!(a.l.clone().apply_playfair(&PlayfairTx { base, kind }.sign(&vec![&a.user; n])).is_err());
 }

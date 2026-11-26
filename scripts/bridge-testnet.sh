@@ -24,7 +24,7 @@ jget() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.arg
 h()    { curl -sf "$1/status" | jget "d['$2']['height']"; }
 w()    { local rpc=$1; shift; "$BIN" wallet --rpc "$rpc" "$@"; }
 wait_h() { # rpc chain height
-  for _ in $(seq 1 150); do [ "$(h "$1" "$2" 2>/dev/null || echo 0)" -ge "$3" ] && return 0; sleep 0.2; done
+  for _ in $(seq 1 300); do [ "$(h "$1" "$2" 2>/dev/null || echo 0)" -ge "$3" ] && return 0; sleep 0.2; done
   fail "$1: $2 did not reach $3"
 }
 wait_until() { # description, command...
@@ -61,9 +61,17 @@ for pair in "$A:a" "$B:b"; do
 done
 ok "both faucets hold Playfair funds"
 
-say "Each network registers the other (on-chain light clients)"
-w "$A" bridge-register --key "$WORK/a/faucet.key" --remote "$B" --name network-b | sed 's/^/  A: /'
-w "$B" bridge-register --key "$WORK/b/faucet.key" --remote "$A" --name network-a | sed 's/^/  B: /'
+say "Each network registers the other (approved by > 2/3 of its own validators)"
+register() { # local-rpc local-dir remote-rpc name
+  local k approvals=()
+  k=$(curl -sf "$3/network" | jget "d['kerckhoffs_height']")
+  for i in 0 1 2; do
+    approvals+=(--approval "$(w "$1" bridge-approve --key "$2/validator-$i/node.key" --remote "$3" --name "$4" --k-height "$k")")
+  done
+  w "$1" bridge-register --key "$2/faucet.key" --remote "$3" --name "$4" --k-height "$k" "${approvals[@]}"
+}
+register "$A" "$WORK/a" "$B" network-b | sed 's/^/  A: /'
+register "$B" "$WORK/b" "$A" network-a | sed 's/^/  B: /'
 wait_h "$A" playfair 2
 wait_h "$B" playfair 2
 ok "A tracks B at Kerckhoffs #$(curl -sf "$A/status" | jget "d['counterparties'][0]['tracked_kerckhoffs_height']"); B tracks A"

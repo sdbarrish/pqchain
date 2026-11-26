@@ -118,15 +118,42 @@ pub fn network_id(c: &Client) -> Result<(Hash, u64), String> {
     Ok((hex32(&v["network_id"])?, v["kerckhoffs_height"].as_u64().ok_or("unexpected RPC reply")?))
 }
 
-/// Register `remote` as a counterparty on `local` (start tracking its
-/// validator set at its current Kerckhoffs height). This first set is the
-/// trust anchor: check the network id out of band.
-pub fn bridge_register(local: &Client, remote: &Client, key: &Keypair, name: &str) -> Result<(Tx, Hash), String> {
-    let (rid, k) = network_id(remote)?;
+/// What registering `remote` at Kerckhoffs height `k` (default: its tip) means:
+/// (network id, height, validator set, digest validators approve).
+pub fn bridge_registration(remote: &Client, name: &str, k: Option<u64>) -> Result<(Hash, u64, crate::playfair::BridgeValidators, Hash), String> {
+    let (rid, tip) = network_id(remote)?;
+    let k = k.unwrap_or(tip);
     let validators = list_from_hex(&remote.get(&format!("/bridge/set/{k}"))?["validators"])?;
+    let digest = crate::playfair::registration_digest(&rid, name, k, &validators);
+    Ok((rid, k, validators, digest))
+}
+
+/// One local validator's approval of a registration, as hex (address + signature).
+pub fn bridge_approve(remote: &Client, validator_key: &Keypair, name: &str, k: u64) -> Result<String, String> {
+    let (_, _, _, digest) = bridge_registration(remote, name, Some(k))?;
+    let a = crate::playfair::approve_registration(validator_key, &digest);
+    Ok(hex::encode(a.to_bytes()))
+}
+
+/// Register `remote` as a counterparty on `local`, with approvals from more
+/// than 2/3 of `local`'s validator stake. The counterparty's set at `k` is the
+/// trust anchor; approving validators are vouching for it.
+pub fn bridge_register(
+    local: &Client,
+    remote: &Client,
+    key: &Keypair,
+    name: &str,
+    k: u64,
+    approvals: &[String],
+) -> Result<(Tx, Hash), String> {
+    let (rid, k, validators, _) = bridge_registration(remote, name, Some(k))?;
+    let approvals = approvals
+        .iter()
+        .map(|h| <(Address, Signature)>::from_bytes(&hex::decode(h).map_err(|e| e.to_string())?))
+        .collect::<Result<Vec<_>, _>>()?;
     let pool = native_only(local.utxos(ChainId::Playfair, &key.address())?);
     let (base, n) = native_transfer_from_pool(pool, Source::Local, key, vec![], None, crate::playfair::REGISTER_FEE - TX_FEE)?;
-    let kind = crate::playfair::PlayfairKind::Register { network_id: rid, name: name.into(), k_height: k, validators };
+    let kind = crate::playfair::PlayfairKind::Register { network_id: rid, name: name.into(), k_height: k, validators, approvals };
     Ok((Tx::Playfair(PlayfairTx { base, kind }.sign(&vec![key; n])), rid))
 }
 

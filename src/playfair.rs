@@ -90,6 +90,29 @@ fn to_validator_set(v: &BridgeValidators) -> ValidatorSet {
         .collect()
 }
 
+/// What this network's validators sign to approve registering a counterparty.
+pub fn registration_digest(network_id: &Hash, name: &str, k_height: u64, validators: &BridgeValidators) -> Hash {
+    Enc::new("pqchain/playfair/registration")
+        .bytes(network_id)
+        .bytes(name.as_bytes())
+        .u64(k_height)
+        .bytes(&bridge_set_hash(validators))
+        .hash()
+}
+
+/// A validator's approval of a registration (sign with its block key).
+pub fn approve_registration(key: &Keypair, digest: &Hash) -> (Address, Signature) {
+    (key.address(), key.sign(ctx::BRIDGE_APPROVE, digest))
+}
+
+/// Check approvals against this network's own active validators.
+pub fn check_approvals(own: &ValidatorSet, digest: &Hash, approvals: &[(Address, Signature)]) -> Result<(), String> {
+    LightClient::from_validators(own)
+        .verify_signed(ctx::BRIDGE_APPROVE, digest, approvals)
+        .map(|_| ())
+        .map_err(|e| format!("registration approvals: {e}"))
+}
+
 /// Asset id of tokens that originate on `origin_network`, as wrapped elsewhere.
 pub fn wrapped_asset(origin_network: &Hash) -> Hash {
     Enc::new("pqchain/playfair/wrapped").bytes(origin_network).hash()
@@ -135,7 +158,15 @@ pub enum PlayfairKind {
     /// Plain transfer / import (funding from the Atbash Chain).
     Transfer,
     /// Start tracking a counterparty at a Kerckhoffs height with its set there.
-    Register { network_id: Hash, name: String, k_height: u64, validators: BridgeValidators },
+    /// Must carry approvals (signatures over `registration_digest`) from more
+    /// than 2/3 of this network's own validator stake.
+    Register {
+        network_id: Hash,
+        name: String,
+        k_height: u64,
+        validators: BridgeValidators,
+        approvals: Vec<(Address, Signature)>,
+    },
     /// Advance the tracked counterparty by one certified Kerckhoffs block.
     Update { network_id: Hash, header: BlockHeader, cert: FinalityCert, validators: BridgeValidators },
     /// Send tokens to `recipient` on `dest_network`.
@@ -150,8 +181,9 @@ impl PlayfairKind {
             PlayfairKind::Transfer => {
                 e.u8(0);
             }
-            PlayfairKind::Register { network_id, name, k_height, validators } => {
-                e.u8(1).bytes(network_id).bytes(name.as_bytes()).u64(*k_height).bytes(&bridge_set_hash(validators));
+            // Approvals are signatures, excluded from the txid like input signatures.
+            PlayfairKind::Register { network_id, name, k_height, validators, .. } => {
+                e.u8(1).bytes(&registration_digest(network_id, name, *k_height, validators));
             }
             PlayfairKind::Update { network_id, header, validators, .. } => {
                 e.u8(2).bytes(network_id).bytes(&header.hash()).bytes(&bridge_set_hash(validators));

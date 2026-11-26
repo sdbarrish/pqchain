@@ -31,7 +31,7 @@ by a third party.
 
 | # | Issue | Severity |
 |---|---|---|
-| B1 | **Registration is a trust anchor.** The first tracked validator set is accepted as given (paid by a fee, not verified). A malicious registration can create a fake counterparty under a real network's id. Users must check the network id and registration out of band; governance-controlled registration is not implemented. | High |
+| B1 | ~~Registration accepted on a fee alone~~ **Fixed.** Registering a counterparty now needs approval signatures from more than 2/3 of this network's own validator stake over the exact (network id, name, height, validator-set hash). Remaining: the approving validators must verify the counterparty's set out of band; the first set is still a trust anchor, now vouched for by the validators. | ~~High~~ Low |
 | B2 | **No update skipping.** Light clients must apply every Kerckhoffs header in order. A counterparty with many Kerckhoffs blocks is expensive to follow. | Low |
 | B3 | **Set pruning.** Only the newest 256 tracked sets are kept; a proof anchored before the oldest kept set cannot be delivered. | Low |
 | B4 | **Zones' safety equals their members' honesty.** A zone with few members can be taken over cheaply; relay messages from it are then forgeable. The Atbash Chain accepts relay messages from any zone. | Medium |
@@ -74,4 +74,5 @@ by a third party.
 | Snapshot decoder accepted non-canonical encodings | `snapshot` fuzzer | Strictly increasing keys required |
 | Contracts could grow memory toward 4 GiB | review during audit preparation | 16 MiB memory cap and instance limits; regression test |
 | Validator weight could overflow on extreme values | Kani review | Saturating addition |
+| Blocks proposed before peers connected were never delivered, stalling the chain (intermittent) | two-network script, after raising alpha | New peers receive pending candidates and mempool; candidates re-announced every second |
 | Consensus setting `alpha = 12` of 20 allowed a 20% adversary to split honest validators | `examples/consensus_analysis.rs` | Defaults `alpha = 14, beta = 20`; `alpha >= 0.7 k` enforced; regression test |

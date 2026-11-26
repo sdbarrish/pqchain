@@ -1090,7 +1090,9 @@ impl Ledger {
 
         match &tx.kind {
             PlayfairKind::Transfer => {}
-            PlayfairKind::Register { network_id, name, k_height, validators } => {
+            PlayfairKind::Register { network_id, name, k_height, validators, approvals } => {
+                let digest = playfair::registration_digest(network_id, name, *k_height, validators);
+                playfair::check_approvals(&self.validators, &digest, approvals)?;
                 if *network_id == self.network_id || self.counterparties.contains_key(network_id) {
                     return Err("network is this network or already registered".into());
                 }

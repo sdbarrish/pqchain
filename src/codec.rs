@@ -581,12 +581,13 @@ impl Wire for PlayfairTx {
         self.base.put(w);
         match &self.kind {
             PlayfairKind::Transfer => w.u8(0),
-            PlayfairKind::Register { network_id, name, k_height, validators } => {
+            PlayfairKind::Register { network_id, name, k_height, validators, approvals } => {
                 w.u8(1);
                 w.fixed(network_id);
                 w.bytes(name.as_bytes());
                 w.u64(*k_height);
                 w.list(validators);
+                w.list(approvals);
             }
             PlayfairKind::Update { network_id, header, cert, validators } => {
                 w.u8(2);
@@ -618,7 +619,7 @@ impl Wire for PlayfairTx {
                 if name.len() > 32 {
                     return Err("counterparty name too long".into());
                 }
-                PlayfairKind::Register { network_id, name, k_height: r.u64()?, validators: r.list()? }
+                PlayfairKind::Register { network_id, name, k_height: r.u64()?, validators: r.list()?, approvals: r.list()? }
             }
             2 => PlayfairKind::Update {
                 network_id: r.hash()?,

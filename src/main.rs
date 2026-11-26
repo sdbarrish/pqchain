@@ -228,7 +228,21 @@ enum WalletCmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Playfair bridge: start tracking another network (pays the registration fee).
+    /// Playfair bridge (run by each validator): approve registering another
+    /// network at a Kerckhoffs height. Prints the approval as hex.
+    BridgeApprove {
+        /// This validator's node key.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        remote: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        k_height: u64,
+    },
+    /// Playfair bridge: start tracking another network. Needs approvals from
+    /// more than 2/3 of this network's validator stake (see bridge-approve).
     BridgeRegister {
         #[arg(long)]
         key: PathBuf,
@@ -237,6 +251,11 @@ enum WalletCmd {
         remote: String,
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        k_height: u64,
+        /// Approval hex from bridge-approve (repeat for each validator).
+        #[arg(long = "approval")]
+        approvals: Vec<String>,
     },
     /// Playfair bridge: bring this network's light client of `remote` up to date.
     BridgeSync {
@@ -454,9 +473,12 @@ fn wallet_cmd(rpc: &str, cmd: WalletCmd) -> Result<(), String> {
             std::fs::write(&out, &data).map_err(|e| e.to_string())?;
             println!("rebuilt {} bytes from shards {used:?} -> {}", data.len(), out.display());
         }
-        WalletCmd::BridgeRegister { key, remote, name } => {
+        WalletCmd::BridgeApprove { key, remote, name, k_height } => {
+            println!("{}", wallet::bridge_approve(&Client::new(&remote), &node::load_key(&key)?, &name, k_height)?);
+        }
+        WalletCmd::BridgeRegister { key, remote, name, k_height, approvals } => {
             let k = node::load_key(&key)?;
-            let (tx, rid) = wallet::bridge_register(&c, &Client::new(&remote), &k, &name)?;
+            let (tx, rid) = wallet::bridge_register(&c, &Client::new(&remote), &k, &name, k_height, &approvals)?;
             println!("registering network {} as '{name}'", hex::encode(rid));
             submit(&c, tx)?;
         }

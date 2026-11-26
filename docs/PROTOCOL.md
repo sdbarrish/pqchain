@@ -120,7 +120,7 @@ block). Fee: `1 + ⌈len / 256⌉`.
 | Kind | Rule |
 |---|---|
 | Transfer | fee 1 |
-| Register | fee 100; counterparty network id ≠ own and not registered; name 1–32 B; validator list canonical (§8) |
+| Register | fee 100; approval signatures (context `pqchain/v3/playfair/approve-registration`) over `H(network id, name, height, set hash)` from > 2/3 of this network's active validator stake; counterparty network id ≠ own and not registered; name 1–32 B; validator list canonical (§8) |
 | Update | header is the counterparty's Kerckhoffs block `tip + 1`; certificate matches the header and has > 2/3 of the tracked set at `tip`; new list canonical and hashes to the header's `set_root`. Free |
 | Send | destination registered; amount > 0. If origin = own network: native escrowed for that destination. Otherwise origin must equal the destination (no multi-hop) and that many wrapped tokens are burned. Fee 1 |
 | Receive | proof (§8) valid; message not yet received. If origin = own network: escrow for the source network is reduced (must cover the amount) and native is paid. If origin = source network: wrapped tokens `H("pqchain/playfair/wrapped", origin)` are minted. Otherwise rejected. Free |

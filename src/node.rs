@@ -619,6 +619,15 @@ impl Engine {
         }
         self.send(&peer, &self.peers_msg());
         self.send(&peer, &self.status_msg());
+        // Catch the new peer up on undecided work: without this, a block proposed
+        // before any peer connected (and its transactions) would never be seen by
+        // the others, and the chain would stall.
+        for b in self.cands.values().flatten() {
+            self.send(&peer, &Msg::Block(b.clone()));
+        }
+        for t in self.mempool.iter().take(1_000) {
+            self.send(&peer, &Msg::Tx(t.clone()));
+        }
     }
 
     fn peers_msg(&self) -> Msg {
@@ -1129,6 +1138,10 @@ impl Engine {
         if now - self.last_status >= STATUS_EVERY {
             self.last_status = now;
             self.broadcast(&self.status_msg(), None);
+            // Re-announce undecided candidates in case a peer missed them.
+            for b in self.cands.values().flatten() {
+                self.broadcast(&Msg::Block(b.clone()), None);
+            }
             self.retry_orphans();
         }
     }

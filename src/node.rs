@@ -35,10 +35,42 @@ pub const SNAPSHOT_EVERY: u64 = 20;
 const MAX_KNOWN_PEERS: usize = 1_000;
 const DISCOVERY_EVERY: Duration = Duration::from_secs(2);
 
-/// Testnet consensus parameters. alpha=12 of k=20 keeps the network live
-/// when a validator is offline; mainnet would use a higher alpha.
-pub fn testnet_params() -> Params {
-    Params { k: 20, alpha: 12, beta: 15, max_rounds: 0 }
+/// Sampled-quorum parameters stored in the genesis file (part of the network id).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsensusParams {
+    pub k: usize,
+    pub alpha: usize,
+    pub beta: u32,
+}
+
+impl Default for ConsensusParams {
+    /// k=20, alpha=14, beta=20. See docs/CONSENSUS_ANALYSIS.md: alpha=12 lost
+    /// safety against a split-brain adversary with 20% of stake; alpha=14 kept
+    /// safety up to 30% (the protocol's 1/3 assumption).
+    fn default() -> Self {
+        ConsensusParams { k: 20, alpha: 14, beta: 20 }
+    }
+}
+
+impl ConsensusParams {
+    /// Reject parameter sets the analysis shows to be unsafe: alpha must be at
+    /// least 70% of k.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.k) || !(1..=100).contains(&self.beta) || self.alpha > self.k {
+            return Err("consensus parameters out of range (1 <= k, beta <= 100; alpha <= k)".into());
+        }
+        if self.alpha * 10 < self.k * 7 {
+            return Err(format!(
+                "alpha={} is below 70% of k={}: unsafe against split-brain attacks (see docs/CONSENSUS_ANALYSIS.md)",
+                self.alpha, self.k
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn params(&self) -> Params {
+        Params { k: self.k, alpha: self.alpha, beta: self.beta, max_rounds: 0, adversary: crate::consensus::Adversary::Stall }
+    }
 }
 
 pub fn chain_from_str(s: &str) -> Result<ChainId, String> {
@@ -149,6 +181,9 @@ pub struct Genesis {
     pub network: String,
     pub validators: Vec<GenesisValidatorEntry>,
     pub allocations: Vec<Allocation>,
+    /// Omitted = the safe defaults (k=20, alpha=14, beta=20).
+    #[serde(default)]
+    pub consensus: ConsensusParams,
 }
 
 impl Genesis {
@@ -174,8 +209,16 @@ impl Genesis {
 
     /// Network ID = hash of the network name and the genesis state.
     pub fn network_id(&self) -> Result<Hash, String> {
+        self.consensus.validate()?;
         let root = self.ledger()?.state_root();
-        Ok(Enc::new("pqchain/network-id").bytes(self.network.as_bytes()).bytes(&root).hash())
+        let c = &self.consensus;
+        Ok(Enc::new("pqchain/network-id")
+            .bytes(self.network.as_bytes())
+            .bytes(&root)
+            .u64(c.k as u64)
+            .u64(c.alpha as u64)
+            .u64(c.beta as u64)
+            .hash())
     }
 }
 
@@ -463,7 +506,7 @@ pub struct Engine {
     pub known: BTreeMap<Address, String>,
     last_status: Instant,
     last_sync_req: BTreeMap<ChainId, Instant>,
-    params: Params,
+    pub params: Params,
 }
 
 impl Engine {
@@ -493,7 +536,7 @@ impl Engine {
             known: BTreeMap::new(),
             last_status: now,
             last_sync_req: BTreeMap::new(),
-            params: testnet_params(),
+            params: ConsensusParams::default().params(),
         };
         // Start from the latest snapshot if it covers a prefix of the log;
         // re-execute only the records after it.
@@ -645,12 +688,19 @@ impl Engine {
         if h == tip + 1 {
             match self.ledger.clone().apply_block(&b) {
                 Ok(()) => {
-                    self.quorum.entry(c).or_insert(Quorum {
+                    let q = self.quorum.entry(c).or_insert(Quorum {
                         pref: hash,
                         counts: BTreeMap::new(),
                         last: None,
                         conf: 0,
                     });
+                    // Deterministic tie-break between conflicting candidates: until a
+                    // poll has succeeded, everyone prefers the lowest hash, so nodes
+                    // that saw the candidates in different orders converge quickly.
+                    // (Preference never affects safety, only speed.)
+                    if q.counts.is_empty() && hash < q.pref {
+                        q.pref = hash;
+                    }
                     self.cands.entry(c).or_default().push(b.clone());
                     self.broadcast(&Msg::Block(b), from);
                     self.check_vote_finality(c, h);
@@ -1293,7 +1343,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         records,
     )?));
     let key = Arc::new(load_key(&key_path)?);
-    engine.lock().unwrap().listen = cfg.advertise.clone().unwrap_or_else(|| cfg.listen.clone());
+    {
+        let mut e = engine.lock().unwrap();
+        e.listen = cfg.advertise.clone().unwrap_or_else(|| cfg.listen.clone());
+        e.params = genesis.consensus.params();
+    }
     println!(
         "[{}] node {} starting · network {} · p2p {} · rpc {}",
         cfg.name,

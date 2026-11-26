@@ -155,8 +155,10 @@ node id, key alg, key, weight)`. Used for `set_root` and bridge tracking.
 - **Sampled quorum** (Snowball family). For an undecided height a validator repeatedly samples
   `k = 20` validators, weighted by stake with replacement, and asks for their preferred block. A poll
   succeeds if one block gets ≥ `alpha` votes. The preference follows the block with the most successful
-  polls. The block is accepted after `beta` consecutive successful polls for it. Testnet:
-  `alpha = 12, beta = 15`; poll timeout 400 ms; validators that cannot be reached abstain.
+  polls. The block is accepted after `beta` consecutive successful polls for it. Parameters come from the
+  genesis file and are part of the network id; defaults `k = 20, alpha = 14, beta = 20`; `alpha < 0.7 k`
+  is rejected (see `CONSENSUS_ANALYSIS.md`). Poll timeout 400 ms; unreachable validators abstain.
+  Until a poll succeeds, conflicting candidates are ordered by hash (lowest preferred).
 - **Proposer rounds.** If no candidate exists, the leader for round `r = ⌊waited / 2 s⌋` proposes.
   Honest validators propose at most once per (chain, height, round).
 - **Finality certificates.** After accepting a block, each validator of that chain signs a vote. A

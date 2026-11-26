@@ -9,7 +9,7 @@ by a third party.
 
 | # | Issue | Severity |
 |---|---|---|
-| C1 | **Testnet consensus parameters.** `alpha = 12` of `k = 20` trades safety margin for liveness with 4–6 validators. Mainnet needs a higher `alpha` (e.g. 15–16) and analysis of the resulting safety/liveness bounds. | High |
+| C1 | ~~Testnet consensus parameters unsafe~~ **Fixed.** Analysis showed `alpha = 12` lost safety to a 20% split-brain adversary. Defaults are now `alpha = 14, beta = 20`, configurable per network in genesis with `alpha >= 0.7 k` enforced. Remaining: the analysis is simulation-based (see `CONSENSUS_ANALYSIS.md`). | ~~High~~ Low |
 | C2 | **Votes in polls (chits) are unsigned.** A validator can answer polls inconsistently with no evidence left behind. Only proposer equivocation is slashable; vote equivocation in certificates is not. | Medium |
 | C3 | **Anchor staleness.** Non-Kerckhoffs blocks may use any anchor between the previous one and the local Kerckhoffs tip. A proposer can keep using an old anchor, delaying the effect of validator-set changes; an *exiting* (not slashed) validator remains schedulable under old anchors. | Medium |
 | C4 | **Predictable leader schedule.** Anyone can compute upcoming proposers and target them with DoS. Rounds keep the chain live but slower. | Low |
@@ -74,3 +74,4 @@ by a third party.
 | Snapshot decoder accepted non-canonical encodings | `snapshot` fuzzer | Strictly increasing keys required |
 | Contracts could grow memory toward 4 GiB | review during audit preparation | 16 MiB memory cap and instance limits; regression test |
 | Validator weight could overflow on extreme values | Kani review | Saturating addition |
+| Consensus setting `alpha = 12` of 20 allowed a 20% adversary to split honest validators | `examples/consensus_analysis.rs` | Defaults `alpha = 14, beta = 20`; `alpha >= 0.7 k` enforced; regression test |

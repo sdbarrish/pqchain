@@ -91,7 +91,7 @@ impl Network {
                 candidates.iter().map(|b| n.ledger.clone().apply_block(b).is_ok()).collect();
             let first = split(voters.len()) % candidates.len();
             let initial = if valid[first] { Some(first) } else { valid.iter().position(|v| *v) };
-            voters.push(Voter { weight, byzantine: byzantine.contains(&addr), initial });
+            voters.push(Voter { weight, byzantine: byzantine.contains(&addr), offline: false, initial });
             voter_nodes.push(i);
         }
         if voters.iter().all(|v| v.byzantine || v.initial.is_none()) {

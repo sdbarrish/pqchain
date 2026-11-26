@@ -19,18 +19,32 @@ pub struct Params {
     /// Consecutive successful polls needed to finalize.
     pub beta: u32,
     pub max_rounds: u32,
+    /// Strategy of byzantine voters in simulations (ignored by the node).
+    pub adversary: Adversary,
+}
+
+/// How simulated byzantine voters answer polls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adversary {
+    /// Vote for whatever honest validators prefer least (attack on liveness).
+    Stall,
+    /// Tell each querier what it already prefers, pushing the two halves of
+    /// the network toward different decisions (attack on safety).
+    SplitBrain,
 }
 
 impl Default for Params {
     fn default() -> Self {
         // k=20, alpha=14, beta=20: parameters from the published metastable-consensus research.
-        Params { k: 20, alpha: 14, beta: 20, max_rounds: 5_000 }
+        Params { k: 20, alpha: 14, beta: 20, max_rounds: 5_000, adversary: Adversary::Stall }
     }
 }
 
 pub struct Voter {
     pub weight: u64,
     pub byzantine: bool,
+    /// Offline: never answers (counts as an abstention) and never decides.
+    pub offline: bool,
     /// Initial preferred candidate index (None = has no valid candidate).
     pub initial: Option<usize>,
 }
@@ -81,7 +95,7 @@ pub fn sampled_quorum(voters: &[Voter], n_candidates: usize, p: Params) -> Outco
     let mut st: Vec<Option<QuorumState>> = voters
         .iter()
         .map(|v| {
-            (!v.byzantine).then(|| QuorumState {
+            (!v.byzantine && !v.offline).then(|| QuorumState {
                 pref: v.initial.unwrap_or(0),
                 counts: vec![0; n_candidates],
                 last: None,
@@ -106,13 +120,21 @@ pub fn sampled_quorum(voters: &[Voter], n_candidates: usize, p: Params) -> Outco
         }
         let least = (0..n_candidates).min_by_key(|c| honest_tally[*c]).unwrap();
 
+        let adversary = p.adversary;
         for s in st.iter_mut().flatten().filter(|s| s.decided.is_none()) {
             polls += 1;
             let mut votes = vec![0usize; n_candidates];
             for _ in 0..p.k {
                 let r = rng.random_range(0..total);
                 let j = cum.partition_point(|c| *c <= r);
-                let ans = answers[j].unwrap_or(least);
+                if voters[j].offline {
+                    continue; // no answer: abstention
+                }
+                let ans = match (answers[j], adversary) {
+                    (Some(a), _) => a,
+                    (None, Adversary::Stall) => least,
+                    (None, Adversary::SplitBrain) => s.pref,
+                };
                 votes[ans] += 1;
             }
             let (best, n) = votes.iter().enumerate().max_by_key(|(_, n)| **n).unwrap();

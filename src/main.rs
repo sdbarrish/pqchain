@@ -346,6 +346,7 @@ fn testnet_init(
         network: "pqchain-local-testnet".into(),
         validators: gvals,
         allocations: vec![Allocation { address: faucet_key.address().to_text(), amount: faucet }],
+        consensus: node::ConsensusParams::default(),
     };
     write_json(&dir.join("genesis.json"), &genesis)?;
     println!("testnet created in {}", dir.display());

@@ -86,7 +86,7 @@ fn export_import_moves_value_exactly_once() {
 fn sampled_quorum_is_safe_and_live_with_20pct_byzantine() {
     for _ in 0..20 {
         let voters: Vec<Voter> =
-            (0..10).map(|i| Voter { weight: 1, byzantine: i < 2, initial: Some(i % 2) }).collect();
+            (0..10).map(|i| Voter { weight: 1, byzantine: i < 2, offline: false, initial: Some(i % 2) }).collect();
         let o = sampled_quorum(&voters, 2, Params::default());
         assert!(o.agreed().is_some(), "honest nodes must agree: {o:?}");
     }
@@ -122,4 +122,29 @@ fn rejected_transactions_leave_no_partial_effects() {
     assert!(l.apply_kerckhoffs(&tx).unwrap_err().contains("cap"));
     assert_eq!(l.state_root(), before, "state changed by a rejected transaction");
     assert_eq!(l.burned, 0);
+}
+
+/// Regression (found by examples/consensus_analysis): alpha=12 of k=20 let a
+/// split-brain adversary with 20% of stake make honest validators finalize
+/// different blocks. The defaults (alpha=14) must not, and genesis files with
+/// alpha below 70% of k are rejected.
+#[test]
+fn consensus_params_resist_split_brain() {
+    use pqchain::consensus::Adversary;
+    use pqchain::node::ConsensusParams;
+    let run = |alpha: usize, beta: u32| {
+        let p = Params { k: 20, alpha, beta, max_rounds: 1_500, adversary: Adversary::SplitBrain };
+        (0..100)
+            .filter(|_| {
+                let voters: Vec<Voter> =
+                    (0..10).map(|i| Voter { weight: 1, byzantine: i < 2, offline: false, initial: Some(i % 2) }).collect();
+                let o = sampled_quorum(&voters, 2, p);
+                o.decisions.iter().flatten().collect::<std::collections::BTreeSet<_>>().len() > 1
+            })
+            .count()
+    };
+    assert!(run(12, 15) > 0, "the old testnet setting is expected to be breakable");
+    assert_eq!(run(14, 20), 0, "default setting must stay safe at 20% byzantine");
+    assert!(ConsensusParams { k: 20, alpha: 12, beta: 15 }.validate().is_err());
+    assert!(ConsensusParams::default().validate().is_ok());
 }

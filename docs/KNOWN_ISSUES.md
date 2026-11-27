@@ -20,9 +20,9 @@ by a third party.
 
 | # | Issue | Severity |
 |---|---|---|
-| D1 | **No per-peer rate limits.** A peer can flood transactions, blocks, votes or queries; each vote costs an ML-DSA verification. | Medium |
-| D2 | **Handshake cost.** Each inbound connection costs ML-KEM encapsulation and ML-DSA signing/verification before authentication completes. No connection rate limits. | Medium |
-| D3 | **RPC is unauthenticated and unlimited.** `POST /feistel/query` runs a contract with up to 50M fuel per request; `/bridge/outbox` and `/inbox` scan all blocks. Expose RPC only on trusted interfaces. | Medium |
+| D1 | ~~No per-peer rate limits~~ **Partly fixed.** Each connection has message (500/s, burst 2,000) and byte (16 MiB/s, burst 64 MiB) budgets; a peer exceeding them is disconnected and banned for 60 s. Remaining: bans are per identity, so an attacker can rotate keys (bounded by D2's per-IP handshake limit); budgets are not weighted by message cost (a vote costs an ML-DSA verification). | ~~Medium~~ Low |
+| D2 | ~~Handshake cost unbounded~~ **Partly fixed.** At most 32 inbound handshakes run at once, and each IP may start 4 per second (burst 16); excess connections are dropped before any cryptography. Remaining: a distributed attacker with many IPs can still keep the 32 slots busy. | ~~Medium~~ Low |
+| D3 | ~~RPC unlimited~~ **Partly fixed.** Per-IP budget of 50 requests/s (burst 100); contract queries, scans and submissions cost 10, shard fetches 2; excess requests get HTTP 429 (the wallet backs off and retries). Read-only queries are capped at 2M fuel. Remaining: RPC is still unauthenticated and scans are O(blocks); keep it on trusted interfaces. | ~~Medium~~ Low |
 | D4 | **O(state) per transaction.** Atomic transaction application clones the ledger for each transaction (mempool, proposer, RPC submission). Throughput degrades as state grows. | Medium |
 | D5 | **Discovery poisoning.** Peers can fill the 1,000-entry known-peer table with bogus addresses (dial attempts are bounded but there is no scoring or eviction). Eclipse resistance is not designed in. | Medium |
 | D6 | **Low fees.** Fees are flat and tiny (no fee market or congestion pricing); spam is cheap. | Medium |

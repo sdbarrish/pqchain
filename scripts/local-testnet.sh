@@ -256,6 +256,18 @@ for _ in $(seq 1 50); do grep -q "restored from disk" "$WORK/validator-0.log" &&
 ok "validator-0 $(grep -h "restored from disk" "$WORK/validator-0.log" | tail -1 | sed 's/^\[[^]]*\] //')"
 wait_all kerckhoffs 7 8100
 
+say "Rate limits"
+NID=$(rpc 8104 /network | jget "d['network_id']")
+(cd "$ROOT" && cargo build --release -q --example flood)
+"$ROOT/target/release/examples/flood" 127.0.0.1:$((P2P + 4)) "$NID" 20000 | sed 's/^/  /'
+for _ in $(seq 1 20); do grep -q "banned" "$WORK/full-0.log" && break; sleep 0.2; done
+grep -q "banned" "$WORK/full-0.log" || fail "the flooding peer should have been banned"
+ok "full-0: $(grep -h banned "$WORK/full-0.log" | tail -1 | sed 's/^\[[^]]*\] //')"
+CODES=$(for _ in $(seq 1 200); do curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8103/status"; done | sort | uniq -c | tr -s ' ' | paste -sd, -)
+echo "$CODES" | grep -q 429 || fail "RPC flood should hit the rate limit"
+ok "200 rapid RPC requests to validator-3: HTTP status counts $CODES"
+sleep 3   # let the RPC budget refill before the final checks
+
 say "Final agreement check"
 sleep 1
 ROOTS=()

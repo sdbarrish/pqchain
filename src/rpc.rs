@@ -245,6 +245,37 @@ async fn submit(State(e): State<Shared>, body: String) -> Reply {
     Ok(Json(json!({ "txid": hex::encode(id), "chain": chain_slug(chain) })))
 }
 
+/// Per-IP request budget: tokens per second and burst. Expensive endpoints
+/// (contract queries, scans over all blocks, transaction submission) cost
+/// HEAVY_COST tokens; others cost 1.
+pub const RPC_RATE: (f64, f64) = (50.0, 100.0);
+pub const HEAVY_COST: f64 = 10.0;
+
+fn cost(path: &str) -> f64 {
+    let heavy = ["/feistel/query", "/inbox", "/bridge/outbox", "/tx"];
+    if heavy.iter().any(|p| path.starts_with(p)) {
+        HEAVY_COST
+    } else if path.starts_with("/hamming/shard") {
+        2.0 // light clients fetch many shards; each re-encodes one blob
+    } else {
+        1.0
+    }
+}
+
+async fn rate_limit(
+    State(limiter): State<std::sync::Arc<crate::ratelimit::Limiter<std::net::IpAddr>>>,
+    axum::extract::ConnectInfo(from): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if limiter.take(&from.ip(), cost(req.uri().path())) {
+        next.run(req).await
+    } else {
+        (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "rate limit exceeded; slow down" }))).into_response()
+    }
+}
+
 pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
     let app = Router::new()
         .route("/status", get(status))
@@ -269,6 +300,10 @@ pub async fn serve(addr: &str, engine: Shared) -> Result<(), String> {
         .route("/bridge/outbox/{dest}", get(bridge_outbox))
         .route("/tx", post(submit))
         .with_state(engine);
+    let limiter = std::sync::Arc::new(crate::ratelimit::Limiter::new(RPC_RATE.0, RPC_RATE.1, 100_000));
+    let app = app.layer(axum::middleware::from_fn_with_state(limiter, rate_limit));
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("rpc {addr}: {e}"))?;
-    axum::serve(listener, app).await.map_err(|e| e.to_string())
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await
+        .map_err(|e| e.to_string())
 }

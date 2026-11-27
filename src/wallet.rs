@@ -23,7 +23,20 @@ impl Client {
 
     pub fn get(&self, path: &str) -> Result<Value, String> {
         let url = format!("{}{path}", self.base);
-        match ureq::get(&url).call() {
+        // Back off and retry when the node rate-limits us (HTTP 429).
+        let mut wait = std::time::Duration::from_millis(100);
+        let mut tries = 0;
+        let resp = loop {
+            match ureq::get(&url).call() {
+                Err(ureq::Error::Status(429, _)) if tries < 20 => {
+                    std::thread::sleep(wait);
+                    wait = (wait * 2).min(std::time::Duration::from_secs(2));
+                    tries += 1;
+                }
+                other => break other,
+            }
+        };
+        match resp {
             Ok(r) => serde_json::from_str(&r.into_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
             Err(ureq::Error::Status(_, r)) => Err(r.into_string().unwrap_or_default()),
             Err(e) => Err(format!("{url}: {e}")),

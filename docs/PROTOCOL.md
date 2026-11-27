@@ -202,6 +202,9 @@ at most once (keyed by source chain and outpoint). The Kerckhoffs Chain never ex
 - Network id = `H("pqchain/network-id", name, genesis state root)`. Peers on other networks are refused.
 - Discovery: `Hello{listen}`, `Peers[(id, addr)]` (≤ 64 per message, ≤ 1,000 known). Dialed peers'
   identities are pinned.
+- Rate limits: per connection 500 messages/s (burst 2,000) and 16 MiB/s (burst 64 MiB), exceeding them
+  bans the identity for 60 s; ≤ 32 concurrent inbound handshakes and 4 per IP per second (burst 16).
+  RPC: 50 requests/s per IP (burst 100), heavy endpoints cost 10, read-only queries ≤ 2M fuel.
 
 ## 11. Storage (`src/node.rs`, `src/snapshot.rs`)
 

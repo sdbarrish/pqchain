@@ -30,6 +30,15 @@ pub const MAX_ORPHANS: usize = 256;
 pub const SYNC_BATCH: u64 = 32;
 /// Stop dialing newly discovered peers beyond this many connections.
 pub const MAX_PEERS: usize = 32;
+/// Per-peer message budget (messages/s, burst) and byte budget (bytes/s, burst).
+pub const PEER_MSG_RATE: (f64, f64) = (500.0, 2_000.0);
+pub const PEER_BYTE_RATE: (f64, f64) = (16.0 * 1024.0 * 1024.0, 64.0 * 1024.0 * 1024.0);
+/// How long a peer that exceeded its budget is refused.
+pub const BAN_TIME: Duration = Duration::from_secs(60);
+/// Concurrent inbound handshakes, and handshakes per IP (per second, burst).
+pub const MAX_PENDING_HANDSHAKES: usize = 32;
+pub const HANDSHAKE_RATE_PER_IP: (f64, f64) = (4.0, 16.0);
+
 /// Write a ledger snapshot every this many log records.
 pub const SNAPSHOT_EVERY: u64 = 20;
 const MAX_KNOWN_PEERS: usize = 1_000;
@@ -617,6 +626,8 @@ pub struct Engine {
     pub listen: String,
     /// Discovered peers: node id -> dialable address.
     pub known: BTreeMap<Address, String>,
+    /// Peers refused until the given time (exceeded their rate budget).
+    pub banned: BTreeMap<Address, Instant>,
     last_status: Instant,
     last_sync_req: BTreeMap<ChainId, Instant>,
     pub params: Params,
@@ -647,6 +658,7 @@ impl Engine {
             peers: BTreeMap::new(),
             listen: String::new(),
             known: BTreeMap::new(),
+            banned: BTreeMap::new(),
             last_status: now,
             last_sync_req: BTreeMap::new(),
             params: ConsensusParams::default().params(),
@@ -756,11 +768,22 @@ impl Engine {
     }
 
     /// Known peers worth dialing: not connected, not ourselves, within MAX_PEERS.
+    pub fn is_banned(&self, peer: &Address) -> bool {
+        self.banned.get(peer).is_some_and(|until| *until > Instant::now())
+    }
+
+    pub fn ban(&mut self, peer: Address, why: &str) {
+        self.banned.retain(|_, until| *until > Instant::now());
+        self.banned.insert(peer, Instant::now() + BAN_TIME);
+        self.peers.remove(&peer);
+        self.log(format!("banned {peer} for {}s: {why}", BAN_TIME.as_secs()));
+    }
+
     pub fn dial_candidates(&self) -> Vec<(Address, String)> {
         let room = MAX_PEERS.saturating_sub(self.peers.len());
         self.known
             .iter()
-            .filter(|(a, _)| !self.peers.contains_key(*a) && **a != self.me)
+            .filter(|(a, _)| !self.peers.contains_key(*a) && **a != self.me && !self.is_banned(a))
             .take(room)
             .map(|(a, l)| (*a, l.clone()))
             .collect()
@@ -1404,7 +1427,7 @@ async fn run_session(engine: Shared, sess: transport::Session) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
         let mut e = engine.lock().unwrap();
-        if peer == e.me {
+        if peer == e.me || e.is_banned(&peer) {
             return;
         }
         e.peers.insert(peer, (conn, tx));
@@ -1419,8 +1442,14 @@ async fn run_session(engine: Shared, sess: transport::Session) {
         }
     });
     let mut reader = sess.reader;
+    let mut msgs = crate::ratelimit::Bucket::new(PEER_MSG_RATE.0, PEER_MSG_RATE.1);
+    let mut volume = crate::ratelimit::Bucket::new(PEER_BYTE_RATE.0, PEER_BYTE_RATE.1);
     loop {
         let Ok(bytes) = reader.recv().await else { break };
+        if !msgs.take(1.0) || !volume.take(bytes.len() as f64) {
+            engine.lock().unwrap().ban(peer, "message rate limit exceeded");
+            break;
+        }
         match Msg::from_bytes(&bytes) {
             Ok(m) => engine.lock().unwrap().on_msg(peer, m),
             Err(err) => {
@@ -1488,11 +1517,20 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     {
         let (engine, key) = (engine.clone(), key.clone());
         tokio::spawn(async move {
+            let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+            let per_ip = Arc::new(crate::ratelimit::Limiter::new(HANDSHAKE_RATE_PER_IP.0, HANDSHAKE_RATE_PER_IP.1, 10_000));
             loop {
-                let Ok((s, _)) = listener.accept().await else { continue };
+                let Ok((s, from)) = listener.accept().await else { continue };
+                // Handshakes cost ML-KEM + ML-DSA work before the peer is
+                // authenticated: bound them per IP and in total.
+                if !per_ip.take(&from.ip(), 1.0) {
+                    continue; // drop the connection
+                }
+                let Ok(permit) = pending.clone().try_acquire_owned() else { continue };
                 let (engine, key) = (engine.clone(), key.clone());
                 tokio::spawn(async move {
                     let hs = tokio::time::timeout(Duration::from_secs(10), transport::accept(s, &key, &network_id)).await;
+                    drop(permit);
                     match hs {
                         Ok(Ok(sess)) => run_session(engine, sess).await,
                         Ok(Err(e)) => eprintln!("inbound handshake failed: {e}"),

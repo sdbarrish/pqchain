@@ -347,9 +347,13 @@ fn run(
 }
 
 /// Read-only call: runs on a copy of the state and returns the output.
+/// Fuel available to a read-only query (much lower than MAX_FUEL: queries
+/// are free and reachable over RPC).
+pub const QUERY_FUEL: u64 = 2_000_000;
+
 pub fn query(st: &FeistelState, contract: Address, method: &str, input: Vec<u8>) -> Result<Vec<u8>, String> {
     let mut scratch = st.clone();
-    run(&mut scratch, contract, method, input, Address([0; 32]), 0, MAX_FUEL).map(|r| r.0).map_err(|e| e.0)
+    run(&mut scratch, contract, method, input, Address([0; 32]), 0, QUERY_FUEL).map(|r| r.0).map_err(|e| e.0)
 }
 
 /// Execute an action on `st` (a scratch copy). Returns receipt fields on
